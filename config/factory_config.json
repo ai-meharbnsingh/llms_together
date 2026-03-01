@@ -1,0 +1,186 @@
+{
+  "factory": {
+    "version": "1.1.0",
+    "working_dir": "~/working",
+    "factory_state_dir": "factory_state",
+    "log_level": "INFO",
+    "git_repo": null,
+    "db_writer": "watchdog_only"
+  },
+  "workers": {
+    "deepseek": {
+      "type": "local_ollama",
+      "model": "deepseek-coder-v2:16b",
+      "api_base": "http://localhost:11434",
+      "max_retries": 2,
+      "timeout": 120,
+      "max_context_tokens": 65536
+    },
+    "qwen": {
+      "type": "local_ollama",
+      "model": "qwen2.5-coder:7b",
+      "api_base": "http://localhost:11434",
+      "max_retries": 2,
+      "timeout": 60,
+      "max_context_tokens": 32768
+    },
+    "claude": {
+      "type": "cli_login",
+      "cli_command": "claude",
+      "auth_method": "max_plan_login",
+      "max_retries": 3,
+      "timeout": 180,
+      "max_context_tokens": 200000
+    },
+    "kimi": {
+      "type": "cli_login",
+      "cli_command": "kimi",
+      "auth_method": "moderato_plan_login",
+      "max_retries": 2,
+      "timeout": 120,
+      "max_context_tokens": 128000
+    },
+    "gemini": {
+      "type": "dual_auth",
+      "cli_command": "gemini",
+      "auth_method": "plan_login",
+      "api_key_env": "GOOGLE_API_KEY",
+      "preferred_auth": "cli_login",
+      "model": "gemini-2.0-flash",
+      "max_retries": 2,
+      "timeout": 120,
+      "max_context_tokens": 1000000
+    },
+    "phi3": {
+      "type": "local_ollama",
+      "model": "phi3:mini",
+      "api_base": "http://localhost:11434",
+      "max_retries": 1,
+      "timeout": 30,
+      "max_context_tokens": 4096,
+      "instances": 6
+    }
+  },
+  "roles": {
+    "code_generation_simple": {
+      "primary": "qwen",
+      "fallback": "deepseek"
+    },
+    "code_generation_complex": {
+      "primary": "deepseek",
+      "fallback": "qwen"
+    },
+    "tdd_testing": {
+      "primary": "claude",
+      "fallback": "gemini"
+    },
+    "gatekeeper_review": {
+      "primary": "kimi",
+      "fallback": "claude"
+    },
+    "architecture_audit": {
+      "primary": "gemini",
+      "fallback": "claude"
+    },
+    "task_planning_gsd": {
+      "primary": "claude",
+      "fallback": "kimi"
+    },
+    "blueprint_generation": {
+      "primary": "claude",
+      "fallback": "gemini"
+    },
+    "summarization": {
+      "primary": "deepseek"
+    },
+    "frontend_design": {
+      "primary": "claude",
+      "fallback": "gemini"
+    },
+    "project_classification": {
+      "primary": "kimi",
+      "fallback": "claude"
+    }
+  },
+  "project_types": {
+    "enabled_types": [
+      "web",
+      "mobile",
+      "iot",
+      "plm"
+    ],
+    "auto_classify": true,
+    "default_type": "web",
+    "default_sub_type": "website",
+    "supported": {
+      "web": {
+        "sub_types": [
+          "ecommerce",
+          "saas",
+          "website",
+          "dashboard",
+          "api"
+        ],
+        "default_sub": "website"
+      },
+      "mobile": {
+        "sub_types": [
+          "react_native",
+          "flutter",
+          "pwa"
+        ],
+        "default_sub": "react_native"
+      },
+      "iot": {
+        "sub_types": [
+          "sensor_system",
+          "edge_computing",
+          "automation"
+        ],
+        "default_sub": "sensor_system"
+      },
+      "plm": {
+        "sub_types": [
+          "bom_management",
+          "tolerance_calculator",
+          "erp_integration",
+          "driveline_config"
+        ],
+        "default_sub": "bom_management"
+      }
+    },
+    "custom_rules": {}
+  },
+  "figma_mcp": {
+    "enabled": true,
+    "server_type": "community_free",
+    "community_repo": "https://github.com/antonytm/figma-mcp-server",
+    "websocket_port": 9000,
+    "local_server_url": "http://localhost:38450",
+    "notes": "Free community MCP server - read+write Figma designs. Requires Figma desktop app + plugin."
+  },
+  "watchdog": {
+    "monitoring_interval_seconds": 30,
+    "task_timeout_minutes": 10,
+    "checkpoint_required_interval_minutes": 5,
+    "context_respawn_threshold": 0.7,
+    "max_respawn_attempts": 3,
+    "db_write_batch_interval_seconds": 5
+  },
+  "quality_gates": {
+    "security_scan_enabled": true,
+    "test_coverage_threshold": 0.9,
+    "alignment_validation": "enforced",
+    "confidence_threshold": 0.9
+  },
+  "cost_controls": {
+    "local_model_preference": 0.8,
+    "max_api_cost_per_project": 50.0,
+    "track_cli_usage": true
+  },
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8420,
+    "refresh_interval_ms": 2000
+  }
+}

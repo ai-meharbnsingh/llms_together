@@ -41,3 +41,6 @@ No_ai_detection/
 # Environment
 .env
 .env.*
+
+# Forensic reports
+kimi.md

@@ -1,0 +1,48 @@
+name: Deploy API
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Migrate
+        run: python -m database.migrate
+        env:
+          DATABASE_URL: postgresql://postgres:test@localhost:5432/test_db
+      - name: Test
+        run: pytest tests/ -v
+        env:
+          DATABASE_URL: postgresql://postgres:test@localhost:5432/test_db
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: |
+          docker build -t ${{ github.repository }}:latest .
+          docker push ${{ github.repository }}:latest

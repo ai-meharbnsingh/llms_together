@@ -208,11 +208,18 @@ class MasterWatchdog:
     async def _ollama_running(self) -> bool:
         try:
             import aiohttp
+            ollama_base = (
+                self.config.get("workers", {})
+                .get("phi3", {})
+                .get("api_base", "http://localhost:11434")
+                .rstrip("/")
+            )
             async with aiohttp.ClientSession() as s:
-                async with s.get("http://localhost:11434/api/tags",
+                async with s.get(f"{ollama_base}/api/tags",
                                  timeout=aiohttp.ClientTimeout(total=5)) as r:
                     return r.status == 200
         except Exception:
+            logger.debug("Ollama health check failed", exc_info=True)
             return False
 
     async def _check_git(self):
@@ -278,6 +285,80 @@ class MasterWatchdog:
                     max_context_tokens=max_tok,
                     tasks_completed_today=0,
                 )
+
+    # ================================================
+    # PROJECT FOLDER STRUCTURE CREATOR
+    # ================================================
+
+    def create_project_structure(self, project_path: str, project_type: str = "web") -> str:
+        """
+        Create project folder structure based on project type.
+        Called after blueprint approval by the orchestrator.
+
+        Args:
+            project_path: Absolute path where the project root should be created.
+            project_type: One of 'web', 'iot', 'plm', 'mobile'. Defaults to 'web'.
+
+        Returns:
+            The resolved project root path as a string.
+        """
+        base = Path(project_path)
+        base.mkdir(parents=True, exist_ok=True)
+
+        # Common directories for all project types
+        common_dirs = [
+            "contracts",
+            "rules",
+            "tests",
+            "config",
+            "docs",
+        ]
+
+        # Type-specific directories
+        type_dirs = {
+            "web": [
+                "backend",
+                "frontend/components",
+                "frontend/logic",
+                "database/migrations",
+                "database/seeds",
+            ],
+            "iot": [
+                "firmware",
+                "backend",
+                "frontend",
+                "database/migrations",
+                "database/seeds",
+                "tests/hardware_sim",
+            ],
+            "plm": [
+                "engineering",
+                "backend",
+                "frontend",
+                "database/migrations",
+                "database/seeds",
+            ],
+            "mobile": [
+                "app/components",
+                "app/screens",
+                "app/logic",
+                "backend",
+                "database/migrations",
+                "database/seeds",
+            ],
+        }
+
+        dirs = common_dirs + type_dirs.get(project_type, type_dirs["web"])
+
+        for d in dirs:
+            (base / d).mkdir(parents=True, exist_ok=True)
+            # Add .gitkeep to empty dirs so git tracks them
+            gitkeep = base / d / ".gitkeep"
+            if not any((base / d).iterdir()):
+                gitkeep.touch()
+
+        logger.info(f"Created project structure at {base} (type={project_type}, {len(dirs)} dirs)")
+        return str(base)
 
     async def _post_recovery_reconciliation(self):
         """
@@ -423,24 +504,92 @@ class MasterWatchdog:
                 logger.error(f"  {name}: CRASHED - respawning...")
                 await self._respawn(name)
 
-        # 2. Stuck tasks
+        # 2. Stuck tasks — retry once, then escalate with DaC HAL tag
         stuck = self.db.get_stuck_tasks(self.task_timeout)
         for t in stuck:
             ws = self.worker_states.get(t["assigned_to"], {}).get("status", "offline")
             if ws in ("crashed", "offline"):
                 await self._reassign_task(t["task_id"], "worker_crashed")
-            else:
-                self.db.create_escalation(
-                    task_id=t["task_id"],
-                    escalation_type="task_timeout",
-                    escalated_by="watchdog",
-                    reason=f"No progress for {self.task_timeout}+ min",
-                )
+            # Remaining stuck tasks (worker alive but task stalled) handled below
+        await self._handle_stuck_tasks()
 
         # 3. Integrity (every ~8h at 30s intervals = cycle 960)
         if cycle % 960 == 0:
             if not self.db.integrity_check():
                 logger.critical("DB INTEGRITY CHECK FAILED")
+
+    async def _handle_stuck_tasks(self):
+        """Detect stuck tasks, retry once on same worker, then escalate."""
+        timeout = self.config.get("watchdog", {}).get("task_timeout_minutes", 10)
+        stuck = self.db.get_stuck_tasks(timeout_minutes=timeout)
+
+        for task_info in stuck:
+            task_id = task_info["task_id"]
+            assigned_to = task_info.get("assigned_to", "unknown")
+
+            # Get full task data
+            task = self.db.get_task(task_id)
+            if not task:
+                continue
+
+            retry_count = task.get("retry_count", 0) or 0
+            max_retries = task.get("max_retries", 2) or 2
+
+            if retry_count < 1:
+                # First timeout: kill + retry on same worker
+                logger.warning(
+                    f"Task {task_id} stuck (>{timeout}min). "
+                    f"Retry {retry_count + 1}/{max_retries} on {assigned_to}"
+                )
+                self.db.update_task(
+                    task_id,
+                    status="pending",
+                    retry_count=retry_count + 1,
+                    current_step=f"retry_after_timeout_{retry_count + 1}",
+                )
+                self.db.log_decision(
+                    task_id=task_id,
+                    decision_type="task_retry",
+                    decision_maker="watchdog",
+                    decision=f"Retry {retry_count + 1}/{max_retries} on {assigned_to}",
+                    reasoning=f"Task stuck for >{timeout}min, first timeout — retrying",
+                )
+                # FER-CLI-002 FIX: Actively re-queue the task so a worker picks it up.
+                # Without this, the task sits as 'pending' in DB but no worker knows about it.
+                complexity = task.get("complexity", "high")
+                requeued_to = await self.assign_task(task_id, complexity=complexity)
+                if requeued_to:
+                    logger.info(f"  Task {task_id} re-queued to {requeued_to}")
+                else:
+                    logger.warning(f"  Task {task_id} could not be re-queued (no healthy worker)")
+            else:
+                # Already retried: escalate
+                logger.error(
+                    f"Task {task_id} stuck after {retry_count} retries. Escalating."
+                )
+                self.db.update_task(task_id, status="blocked")
+                self.db.create_escalation(
+                    task_id=task_id,
+                    escalation_type="task_timeout",
+                    escalated_by="watchdog",
+                    reason=(
+                        f"Task stuck for >{timeout}min after {retry_count} retries. "
+                        f"Last assigned to: {assigned_to}"
+                    ),
+                    context_data={
+                        "retry_count": retry_count,
+                        "timeout_minutes": timeout,
+                        "last_worker": assigned_to,
+                    },
+                )
+                # Create DaC HAL tag for audit trail
+                self.db.create_dac_tag(
+                    task_id=task_id,
+                    tag_type="HAL",
+                    context=f"Task timed out after {retry_count} retries ({timeout}min each)",
+                    source_step="watchdog_monitor",
+                    source_worker=assigned_to,
+                )
 
     def _health_to_dash(self, h: str) -> str:
         return {"healthy": "idle", "degraded": "active",
@@ -472,30 +621,45 @@ class MasterWatchdog:
             logger.error(f"  {name}: Respawn error: {e}")
 
     async def _reassign_task(self, task_id: str, reason: str):
-        """Reassign a task from a dead/stuck worker to a fallback."""
+        """Reassign a task from a dead/stuck worker to a fallback via RoleRouter."""
         task = self.db.get_task(task_id)
         if not task:
             return
         old = task["assigned_to"]
 
-        if old in ("deepseek", "qwen"):
-            new = "qwen" if old == "deepseek" else "deepseek"
-        elif old == "claude":
-            self.db.create_escalation(
-                task_id=task_id, escalation_type="claude_failure",
-                escalated_by="watchdog", reason=reason,
-            )
-            self.db.update_task(task_id, status="blocked")
-            return
-        else:
-            new = old
+        # FER-CLI-003 FIX: Use RoleRouter to find an alternate worker instead of
+        # hardcoded deepseek/qwen swap. This respects user's role config and works
+        # even if workers are swapped or renamed.
+        new = None
+        if self.role_router:
+            # Find which role the old worker was fulfilling
+            for role_name, assignment in self.role_router._assignments.items():
+                if assignment.primary == old:
+                    # Try the fallback for this role
+                    if assignment.fallback and assignment.fallback != old:
+                        candidate = assignment.fallback
+                        if self.worker_states.get(candidate, {}).get("status") == "healthy":
+                            new = candidate
+                            break
+                elif assignment.fallback == old:
+                    # Old worker was the fallback; try the primary
+                    candidate = assignment.primary
+                    if self.worker_states.get(candidate, {}).get("status") == "healthy":
+                        new = candidate
+                        break
 
-        nw = self.worker_states.get(new, {}).get("status")
-        if nw != "healthy":
+            # If no role-based match, try any healthy worker (excluding the failed one)
+            if not new:
+                for name, state in self.worker_states.items():
+                    if name != old and state.get("status") == "healthy":
+                        new = name
+                        break
+
+        if not new:
             self.db.create_escalation(
                 task_id=task_id, escalation_type="task_timeout",
                 escalated_by="watchdog",
-                reason=f"No worker available (tried {new})",
+                reason=f"No alternate worker available (old={old}). Reason: {reason}",
             )
             self.db.update_task(task_id, status="blocked")
             return
@@ -606,7 +770,7 @@ class MasterWatchdog:
             try:
                 await adapter.close()
             except Exception:
-                pass
+                logger.debug(f"Worker adapter close failed", exc_info=True)
 
         # Clean shutdown: clear state files (no recovery needed)
         self.state_persistence.clear()

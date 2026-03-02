@@ -22,6 +22,7 @@ VALID_ROLES = {
     "code_generation_simple",
     "code_generation_complex",
     "tdd_testing",
+    "tdd_analysis",
     "gatekeeper_review",
     "architecture_audit",
     "task_planning_gsd",
@@ -65,7 +66,10 @@ class RoleRouter:
     def __init__(self, config: dict, workers: Dict[str, WorkerAdapter]):
         self.workers = workers
         self._assignments: Dict[str, RoleAssignment] = {}
+        self._production_assignments: Dict[str, RoleAssignment] = {}
         self._config_path = None
+        self._local_mode: bool = False
+        self._local_roles_config: dict = config.get("local_roles", {})
         self._load_from_config(config)
 
     def _load_from_config(self, config: dict):
@@ -77,7 +81,9 @@ class RoleRouter:
                 continue
             primary = mapping.get("primary", "")
             fallback = mapping.get("fallback")
-            self._assignments[role] = RoleAssignment(role, primary, fallback)
+            assignment = RoleAssignment(role, primary, fallback)
+            self._assignments[role] = assignment
+            self._production_assignments[role] = assignment
             # Warn about unavailable workers
             if primary and primary not in self.workers:
                 logger.warning(f"  Role '{role}': primary '{primary}' not available")
@@ -85,6 +91,51 @@ class RoleRouter:
                 logger.warning(f"  Role '{role}': fallback '{fallback}' not available")
             logger.info(f"  Role '{role}': {primary}" +
                         (f" (fallback: {fallback})" if fallback else ""))
+
+    # --- Local LLM test mode ---
+
+    def set_local_mode(self, enabled: bool) -> dict:
+        """
+        Toggle local LLM test mode.
+        When enabled, ALL roles are remapped to local DeepSeek/Qwen workers.
+        This prevents any Claude/Kimi/Gemini CLI subprocesses from being spawned
+        during E2E testing, eliminating token burn risk entirely.
+        Production mappings are preserved and restored on disable.
+        """
+        if enabled and not self._local_mode:
+            if not self._local_roles_config:
+                return {"error": "No local_roles defined in factory_config.json", "success": False}
+            # Save current (production) assignments
+            self._production_assignments = dict(self._assignments)
+            # Apply local role overrides
+            for role, mapping in self._local_roles_config.items():
+                if role not in VALID_ROLES:
+                    continue
+                primary = mapping.get("primary", "deepseek")
+                fallback = mapping.get("fallback")
+                # Only assign if the worker actually exists
+                if primary in self.workers:
+                    self._assignments[role] = RoleAssignment(role, primary, fallback)
+                else:
+                    logger.warning(f"Local mode: worker '{primary}' not available for role '{role}'")
+            self._local_mode = True
+            logger.info("LOCAL TEST MODE ENABLED — all roles mapped to local LLMs (DeepSeek/Qwen)")
+
+        elif not enabled and self._local_mode:
+            # Restore production assignments
+            self._assignments = dict(self._production_assignments)
+            self._local_mode = False
+            logger.info("LOCAL TEST MODE DISABLED — production role mappings restored")
+
+        return {
+            "success": True,
+            "local_mode": self._local_mode,
+            "assignments": self.get_all_assignments(),
+        }
+
+    @property
+    def is_local_mode(self) -> bool:
+        return self._local_mode
 
     # --- Core: Get worker for a role ---
 

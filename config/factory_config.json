@@ -29,7 +29,7 @@
       "cli_command": "claude",
       "auth_method": "max_plan_login",
       "max_retries": 3,
-      "timeout": 180,
+      "timeout": 600,
       "max_context_tokens": 200000
     },
     "kimi": {
@@ -37,7 +37,7 @@
       "cli_command": "kimi",
       "auth_method": "moderato_plan_login",
       "max_retries": 2,
-      "timeout": 120,
+      "timeout": 600,
       "max_context_tokens": 128000
     },
     "gemini": {
@@ -48,7 +48,7 @@
       "preferred_auth": "cli_login",
       "model": "gemini-2.0-flash",
       "max_retries": 2,
-      "timeout": 120,
+      "timeout": 600,
       "max_context_tokens": 1000000
     },
     "phi3": {
@@ -60,6 +60,20 @@
       "max_context_tokens": 4096,
       "instances": 6
     }
+  },
+  "local_test_mode": false,
+  "local_roles": {
+    "blueprint_generation": { "primary": "deepseek", "fallback": "qwen" },
+    "tdd_testing":          { "primary": "deepseek", "fallback": "qwen" },
+    "tdd_analysis":         { "primary": "deepseek", "fallback": "qwen" },
+    "gatekeeper_review":    { "primary": "qwen",     "fallback": "deepseek" },
+    "architecture_audit":   { "primary": "qwen",     "fallback": "deepseek" },
+    "task_planning_gsd":    { "primary": "deepseek", "fallback": "qwen" },
+    "code_generation_simple": { "primary": "qwen",   "fallback": "deepseek" },
+    "code_generation_complex": { "primary": "deepseek", "fallback": "qwen" },
+    "frontend_design":      { "primary": "deepseek", "fallback": "qwen" },
+    "project_classification": { "primary": "qwen",  "fallback": "deepseek" },
+    "summarization":        { "primary": "deepseek" }
   },
   "roles": {
     "code_generation_simple": {
@@ -73,6 +87,10 @@
     "tdd_testing": {
       "primary": "claude",
       "fallback": "gemini"
+    },
+    "tdd_analysis": {
+      "primary": "deepseek",
+      "fallback": "qwen"
     },
     "gatekeeper_review": {
       "primary": "kimi",

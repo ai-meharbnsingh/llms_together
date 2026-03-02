@@ -7,6 +7,7 @@ Role assignments are hot-swappable from Dashboard UI.
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -37,10 +38,27 @@ def setup_logging(level="INFO"):
     )
 
 
+def _load_config(path: str) -> dict:
+    """Load and parse factory config JSON. Returns None on any error."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
 async def main(config_path: str = None):
     cp = config_path or str(FACTORY_ROOT / "config" / "factory_config.json")
-    with open(cp) as f:
-        cfg = json.load(f)
+    cfg = _load_config(cp)
+    if cfg is None:
+        print(
+            f"ERROR: Cannot load factory config from '{cp}'. "
+            "Check that the file exists and contains valid JSON.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     # Store config path for role saving
     cfg["_config_path"] = cp
@@ -100,13 +118,38 @@ async def main(config_path: str = None):
     logger.info("Orchestrator: ONLINE | Phi3-orchestrator: ONLINE")
     logger.info("")
 
-    # Shutdown handler
-    loop = asyncio.get_event_loop()
+    # Shutdown handler — double-signal guard to prevent orphaned subprocesses
+    loop = asyncio.get_running_loop()
     stop = asyncio.Event()
+    _signal_count = [0]
+
+    def _emergency_kill():
+        """atexit: kill all process groups tracked by reaper on unexpected exit."""
+        try:
+            reaper = watchdog.get_reaper() if hasattr(watchdog, "get_reaper") else None
+            if reaper and hasattr(reaper, "_tracked"):
+                for name, entry in list(reaper._tracked.items()):
+                    pid = entry.get("pid") if isinstance(entry, dict) else getattr(entry, "pid", None)
+                    if pid:
+                        try:
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
+        except Exception:
+            pass
+
+    atexit.register(_emergency_kill)
 
     def _sig():
-        logger.info("Shutdown signal received")
-        stop.set()
+        _signal_count[0] += 1
+        if _signal_count[0] == 1:
+            logger.info("Shutdown signal received — graceful shutdown starting")
+            stop.set()
+        else:
+            # Second signal: hard kill all tracked process groups immediately
+            logger.warning("Second signal — force-killing all subprocesses and exiting")
+            _emergency_kill()
+            sys.exit(1)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _sig)

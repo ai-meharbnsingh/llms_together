@@ -1,0 +1,44 @@
+name: Deploy IoT
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Test backend
+        run: pytest tests/ -v -k "not hardware"
+
+  test-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build firmware (simulation)
+        run: |
+          cd firmware && make sim-build
+        if: hashFiles('firmware/Makefile') != ''
+      - name: Test firmware
+        run: pytest tests/hardware_sim/ -v
+        if: hashFiles('tests/hardware_sim/') != ''
+
+  deploy:
+    needs: [test-backend, test-firmware]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy backend
+        run: docker build -t ${{ github.repository }}-backend:latest .
+      - name: Prepare OTA
+        run: |
+          cd firmware && make release
+        if: hashFiles('firmware/Makefile') != ''

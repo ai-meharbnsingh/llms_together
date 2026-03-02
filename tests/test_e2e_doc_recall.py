@@ -963,7 +963,7 @@ class TestWarmMemoryContextBuilder:
         return router
 
     def test_doc_prefix_when_sparse(self, tmp_db, mock_router):
-        """When < 5 relevant messages, DoC is prepended as LONG-TERM CONTEXT."""
+        """When < 5 relevant messages in orchestrator mode, DoC is prepended as LONG-TERM CONTEXT."""
         db_path, wdb = tmp_db
         wdb.save_context_summary(
             instance_name="phi3-orchestrator",
@@ -975,18 +975,18 @@ class TestWarmMemoryContextBuilder:
         rdb = ReadOnlyDB(db_path)
         orch = MasterOrchestrator(rdb, mock_router, {}, "/tmp/test_working")
 
-        # Add 3 relevant messages (< 5 threshold)
+        # Add 3 relevant messages in orchestrator mode (< 5 threshold)
         for i in range(3):
             orch.chat_history.append({
-                "role": "user", "content": f"direct msg {i}",
+                "role": "user", "content": f"orch msg {i}",
                 "timestamp": datetime.now().isoformat(),
-                "metadata": {"mode": "direct", "worker": "qwen"},
+                "metadata": {"mode": "orchestrator"},
             })
 
-        ctx = orch._build_conversation_context("direct", "qwen")
+        ctx = orch._build_conversation_context("orchestrator", "qwen")
         assert "LONG-TERM CONTEXT" in ctx
         assert "Use React with TypeScript" in ctx
-        assert "direct msg" in ctx
+        assert "orch msg" in ctx
 
     def test_no_doc_when_rich(self, tmp_db, mock_router):
         """When >= 5 relevant messages, DoC is NOT prepended."""
@@ -1066,14 +1066,14 @@ class TestWarmMemoryContextBuilder:
 class TestSchemaMigration:
     """Tests that schema migration from v1 to v2 works."""
 
-    def test_fresh_db_is_v2(self, tmp_path):
-        """A fresh database gets schema version 2."""
+    def test_fresh_db_is_v3(self, tmp_path):
+        """A fresh database gets schema version 3 (v3 added dac_tags, learning_log, cost_tracking)."""
         db_path = str(tmp_path / "fresh.db")
         wdb = WatchdogDB(db_path)
         import sqlite3
         conn = sqlite3.connect(db_path)
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 2
+        assert row[0] == 3
         # chat_archive table exists
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_archive'"

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -60,6 +61,25 @@ class CLIWorkerAdapter(WorkerAdapter):
         """Inject process reaper for subprocess tracking."""
         self._reaper = reaper
 
+    @staticmethod
+    def _kill_proc_group(proc) -> None:
+        """Kill the entire process group of a subprocess.
+
+        Node.js (Claude CLI) spawns child processes that survive a bare proc.kill().
+        By killing the entire process group (SIGKILL) we ensure all descendants
+        are reaped and no orphaned subprocesses remain to burn tokens.
+        Falls back to proc.kill() if process-group kill is unavailable.
+        """
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
     def _get_cli_path(self) -> Optional[str]:
         return shutil.which(self.cli_command)
 
@@ -91,6 +111,7 @@ class CLIWorkerAdapter(WorkerAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._clean_env(),
+                start_new_session=True,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=stdin_input.encode() if stdin_input else None),
@@ -159,6 +180,7 @@ class CLIWorkerAdapter(WorkerAdapter):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=self._clean_env(),
+                    start_new_session=True,  # own process group → kill -9 kills Node.js tree
                 )
 
                 # Register with reaper (no parent — workers are in-process,
@@ -170,11 +192,50 @@ class CLIWorkerAdapter(WorkerAdapter):
                         max_silent=self.timeout + 30,
                     )
 
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(input=stdin_input.encode() if stdin_input else None),
-                    timeout=self.timeout,
-                )
-                out = stdout.decode("utf-8", errors="replace").strip()
+                if stdin_input:
+                    proc.stdin.write(stdin_input.encode())
+                    try:
+                        await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    proc.stdin.close()
+
+                stdout_data = bytearray()
+                stderr_data = bytearray()
+                last_active = time.time()
+
+                async def read_stream(stream, buffer):
+                    nonlocal last_active
+                    while True:
+                        chunk = await stream.read(4096)
+                        if not chunk:
+                            break
+                        buffer.extend(chunk)
+                        last_active = time.time()
+
+                stdout_task = asyncio.create_task(read_stream(proc.stdout, stdout_data))
+                stderr_task = asyncio.create_task(read_stream(proc.stderr, stderr_data))
+
+                pending_tasks = {stdout_task, stderr_task}
+                while pending_tasks:
+                    done, pending_tasks = await asyncio.wait(
+                        pending_tasks, 
+                        timeout=1.0, 
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if time.time() - last_active > self.timeout:
+                        for t in pending_tasks:
+                            t.cancel()
+                        raise asyncio.TimeoutError(f"Idle timeout of {self.timeout}s exceeded")
+
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    # Process didn't exit cleanly — kill the process group
+                    logger.debug(f"{self.name}: proc.wait() timed out, killing process group")
+                    self._kill_proc_group(proc)
+
+                out = stdout_data.decode("utf-8", errors="replace").strip()
 
                 # Unregister from reaper (clean exit)
                 if self._reaper:
@@ -192,13 +253,13 @@ class CLIWorkerAdapter(WorkerAdapter):
                     await asyncio.sleep(2 ** attempt)
 
             except asyncio.TimeoutError:
-                logger.error(f"{self.name}: Timeout {self.timeout}s - killing subprocess")
+                logger.error(f"{self.name}: Timeout {self.timeout}s - killing process group")
                 if proc:
                     try:
-                        proc.kill()
-                        await proc.wait()
+                        self._kill_proc_group(proc)
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
                     except Exception:
-                        pass
+                        logger.debug(f"{self.name}: kill after timeout failed", exc_info=True)
                 if self._reaper:
                     self._reaper.unregister(tracker_name)
                 if attempt < self.max_retries:
@@ -208,10 +269,10 @@ class CLIWorkerAdapter(WorkerAdapter):
                 logger.error(f"{self.name}: {e}")
                 if proc and proc.returncode is None:
                     try:
-                        proc.kill()
-                        await proc.wait()
+                        self._kill_proc_group(proc)
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
                     except Exception:
-                        pass
+                        logger.debug(f"{self.name}: kill in error handler failed", exc_info=True)
                 if self._reaper:
                     self._reaper.unregister(tracker_name)
                 if attempt < self.max_retries:
@@ -245,31 +306,65 @@ class CLIWorkerAdapter(WorkerAdapter):
             return "\n\n".join(cleaned).strip()
         return raw
 
+    # Maximum message size accepted by CLI workers (512 KB).
+    # Prevents hitting OS argument-length limits when message is passed as a CLI arg.
+    _MAX_MESSAGE_BYTES = 512 * 1024
+
+    @staticmethod
+    def _sanitize_cli_input(text: str) -> str:
+        """
+        Sanitize text before passing to CLI subprocess.
+        - Rejects messages over 512 KB (raises ValueError).
+        - Strips null bytes that could truncate arguments.
+        - Prepends a space if text starts with '-' to prevent flag injection.
+        """
+        if not text:
+            return text
+        # Guard: reject oversized messages before they hit OS arg-length limits
+        if len(text.encode("utf-8", errors="replace")) > CLIWorkerAdapter._MAX_MESSAGE_BYTES:
+            raise ValueError(
+                f"Message too large for CLI worker: "
+                f"{len(text)} chars exceeds {CLIWorkerAdapter._MAX_MESSAGE_BYTES // 1024} KB limit"
+            )
+        # Remove null bytes
+        text = text.replace('\x00', '')
+        # Prevent flag injection: if text starts with -, prepend a space
+        # so the CLI doesn't interpret it as a flag
+        if text.lstrip().startswith('-'):
+            text = ' ' + text.lstrip()
+        return text
+
     def _build_command(self, cli_path, message, system_prompt=None, files=None):
         """
         Returns (cmd_list, stdin_input_or_None).
         Claude: prompt via stdin + --print (proven pattern from Streamlit app).
         Kimi/Gemini: prompt via --prompt flag.
+        All user-supplied text is sanitized before passing to CLI.
         """
+        safe_message = self._sanitize_cli_input(message)
+        safe_system = self._sanitize_cli_input(system_prompt) if system_prompt else None
+
         if self.name == "claude":
             # Claude: send prompt via stdin, use --print for non-interactive
             cmd = [cli_path, "--print", "--output-format", "text"]
-            if system_prompt:
-                cmd.extend(["--system-prompt", system_prompt])
+            if safe_system:
+                cmd.extend(["--system-prompt", safe_system])
             if files:
                 for f in files:
-                    cmd.extend(["--file", f])
-            return (cmd, message)  # message goes to stdin
+                    # Only allow files within expected paths (no flag injection via filenames)
+                    if not f.startswith('-'):
+                        cmd.extend(["--file", f])
+            return (cmd, safe_message)  # message goes to stdin
         elif self.name == "kimi":
             # Kimi: --print -p for non-interactive (mirrors Claude pattern)
-            cmd = [cli_path, "--print", "-p", message, "--output-format", "text"]
+            cmd = [cli_path, "--print", "-p", safe_message, "--output-format", "text"]
             return (cmd, None)
         elif self.name == "gemini":
-            cmd = [cli_path, "--prompt", message, "--output-format", "text"]
+            cmd = [cli_path, "--prompt", safe_message, "--output-format", "text"]
             return (cmd, None)
         else:
             # Generic fallback
-            cmd = [cli_path, "--prompt", message]
+            cmd = [cli_path, "--prompt", safe_message]
             return (cmd, None)
 
     async def check_health(self) -> str:
@@ -278,6 +373,7 @@ class CLIWorkerAdapter(WorkerAdapter):
         try:
             return "healthy" if await self.is_authenticated() else "degraded"
         except Exception:
+            logger.debug(f"{self.name}: health check failed", exc_info=True)
             return "crashed"
 
 
@@ -357,6 +453,7 @@ class OllamaWorkerAdapter(WorkerAdapter):
                     return "healthy" if await self.is_authenticated() else "degraded"
             return "crashed"
         except Exception:
+            logger.debug(f"{self.name}: Ollama health check failed", exc_info=True)
             return "offline"
 
     async def close(self):

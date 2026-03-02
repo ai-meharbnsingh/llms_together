@@ -1,0 +1,38 @@
+name: Deploy Web App
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check .
+      - name: Test
+        run: pytest tests/ -v --tb=short
+      - name: Build frontend
+        run: |
+          cd frontend && npm ci && npm run build
+        if: hashFiles('frontend/package.json') != ''
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ github.repository }}:latest .
+          docker push ${{ github.repository }}:latest

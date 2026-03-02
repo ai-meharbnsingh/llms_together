@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,24 @@ from typing import Callable, Dict, List, Optional
 from orchestration.database import ReadOnlyDB
 from orchestration.role_router import RoleRouter
 from workers.adapters import WorkerAdapter
+
+# Autonomous execution engine imports — guarded so existing functionality
+# continues even if these modules aren't present yet.
+try:
+    from orchestration.context_manager import ContextManager
+    from orchestration.contract_generator import ContractGenerator
+    from orchestration.contract_validator import ContractValidator
+    from orchestration.output_parser import OutputParser
+    from orchestration.rules_engine import RulesEngine
+    from orchestration.tdd_pipeline import TDDPipeline
+    from orchestration.git_manager import GitManager
+    from orchestration.dac_tagger import DaCTagger
+    from orchestration.learning_log import LearningLog
+    from orchestration.cicd_generator import CICDGenerator
+except ImportError as _exc:
+    logging.getLogger("factory.orchestrator").warning(
+        f"Optional execution-engine imports unavailable: {_exc}"
+    )
 
 logger = logging.getLogger("factory.orchestrator")
 
@@ -41,11 +60,16 @@ class MasterOrchestrator:
         self.working_dir = Path(working_dir).expanduser()
         self.current_project = None
 
-        # Chat history — persisted to disk so it survives restarts
-        state_dir = config.get("factory", {}).get("factory_state_dir")
-        if state_dir:
-            self._history_file = Path(state_dir) / "chat_history.json"
-            self._sessions_file = Path(state_dir) / "chat_sessions.json"
+        # Chat history — persisted to disk so it survives restarts.
+        # FER-AF-001 FIX: resolve relative factory_state_dir against working_dir so
+        # Orchestrator and Watchdog always write to the same physical directory.
+        state_dir_cfg = config.get("factory", {}).get("factory_state_dir")
+        if state_dir_cfg:
+            _sd = Path(state_dir_cfg)
+            if not _sd.is_absolute():
+                _sd = self.working_dir / "autonomous_factory" / _sd
+            self._history_file = _sd / "chat_history.json"
+            self._sessions_file = _sd / "chat_sessions.json"
             self._history_file.parent.mkdir(parents=True, exist_ok=True)
         else:
             self._history_file = None
@@ -65,6 +89,13 @@ class MasterOrchestrator:
         # Discussion mode — cancellation event + live participant list
         self._discussion_cancel = asyncio.Event()
         self._discussion_participants: List[str] = []
+
+        # FER-AF-036: Semaphore to cap concurrent task execution
+        _max_concurrent = config.get("execution", {}).get("max_concurrent_tasks", 4)
+        self._task_semaphore = asyncio.Semaphore(_max_concurrent)
+
+        # FER-AF-040: Lock to serialise merge_to_develop calls
+        self._merge_lock = asyncio.Lock()
 
         # Document of Context — loaded from DB on recovery
         self._doc_context = None
@@ -951,6 +982,10 @@ class MasterOrchestrator:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.communicate()
 
+        # FER-AF-026: Use fire-and-forget request_write — not request_write_and_wait.
+        # request_write_and_wait blocks until Watchdog drains the queue; in environments
+        # without a running Watchdog it times out. Fire-and-forget matches every other
+        # write in this codebase.
         self.db.request_write("insert", "projects", {
             "project_id": project_id,
             "name": name,
@@ -1090,11 +1125,24 @@ class MasterOrchestrator:
             if start >= 0 and end > start:
                 task_defs = json.loads(text[start:end])
             else:
-                task_defs = []
+                task_defs = None
         except json.JSONDecodeError:
-            logger.error("GSD output not valid JSON — falling back to raw")
-            task_defs = [{"module": "backend", "description": result["response"],
-                          "complexity_hint": "high"}]
+            task_defs = None
+
+        # FER-AF-013 FIX: Never store raw LLM response as task description.
+        # If the planner returned unparseable output, surface a hard error so
+        # callers can retry or abort — not silently create a garbage task.
+        if task_defs is None:
+            snippet = result["response"][:200]
+            logger.error(
+                f"GSD task-planner returned non-JSON output (phase {phase}). "
+                f"Snippet: {snippet!r}"
+            )
+            return {
+                "error": "GSD planner output was not valid JSON — cannot create tasks",
+                "_handler": "plan_tasks_gsd",
+                "_worker": planner_name,
+            }
 
         return {
             "tasks": task_defs,
@@ -1104,145 +1152,6 @@ class MasterOrchestrator:
             "_handler": "plan_tasks_gsd",
             "_worker": planner_name,
         }
-
-    # ─── Phase 1-3: Tasks ───
-
-    async def create_phase_tasks(self, phase: int, defs: list) -> list:
-        ids = []
-        for i, d in enumerate(defs):
-            tid = f"task_{self.current_project}_{phase}_{i+1:03d}"
-            self.db.request_write("insert", "tasks", {
-                "task_id": tid,
-                "project_id": self.current_project,
-                "phase": phase,
-                "module": d.get("module", "backend"),
-                "description": d.get("description", ""),
-                "status": "pending",
-            })
-            ids.append(tid)
-        return ids
-
-    async def classify_task(self, task_id: str) -> dict:
-        """Uses role: gatekeeper_review for classification."""
-        classifier = self._get_worker("gatekeeper_review")
-        task = self.db.get_task(task_id)
-        if not task:
-            return {"error": "Task not found"}
-
-        prompt = (
-            f"Classify this task complexity as LOW or HIGH.\n"
-            f"Task: {task['description']}\nModule: {task['module']}\n"
-            f"Respond JSON: {{\"complexity\": \"LOW\" or \"HIGH\", "
-            f"\"task_detail\": ..., \"acceptance_criteria\": ...}}"
-        )
-
-        complexity = "low"
-        task_content = ""
-        if classifier:
-            r = await classifier.send_message(prompt)
-            if r.get("success"):
-                task_content = r["response"]
-                complexity = "high" if "HIGH" in r["response"].upper() else "low"
-
-        tf = self._save_task_file(task_id, task_content or task["description"])
-
-        self.db.request_write("update", "tasks", {
-            "_where": {"task_id": task_id},
-            "complexity": complexity,
-            "task_file_path": tf,
-        })
-
-        return {"task_id": task_id, "complexity": complexity, "task_file": tf}
-
-    def _save_task_file(self, task_id, content) -> str:
-        d = self.working_dir / "autonomous_factory" / "factory_state" / "tasks"
-        d.mkdir(parents=True, exist_ok=True)
-        p = d / f"{task_id}.md"
-        p.write_text(content)
-        return str(p)
-
-    async def send_to_tdd(self, task_id: str) -> dict:
-        """Uses role: tdd_testing."""
-        tdd_worker = self._get_worker("tdd_testing")
-        if not tdd_worker:
-            return {"error": "No worker for tdd_testing role"}
-
-        tdd_name = self._get_worker_name("tdd_testing")
-        task = self.db.get_task(task_id)
-        ctx = ""
-        tf = (task or {}).get("task_file_path", "")
-        if tf and os.path.exists(tf):
-            ctx = Path(tf).read_text()
-
-        prompt = self._tdd_prompt(task or {}, ctx)
-
-        self.db.request_write("update", "tasks", {
-            "_where": {"task_id": task_id},
-            "status": "testing", "assigned_to": tdd_name, "current_step": "AC",
-        })
-
-        logger.info(f"TDD: {task_id} → {tdd_name}")
-        r = await tdd_worker.send_message(prompt, system_prompt=TDD_SYSTEM)
-        if r.get("success"):
-            self.db.request_write("insert", "checkpoints", {
-                "task_id": task_id, "worker": tdd_name,
-                "step": "TDD_COMPLETE",
-                "state_data": json.dumps({"len": len(r["response"])}),
-            })
-            self.db.request_write("update", "tasks", {
-                "_where": {"task_id": task_id},
-                "current_step": "TDD_COMPLETE", "status": "review",
-            })
-            return {"success": True, "task_id": task_id, "tdd_by": tdd_name}
-        return {"error": r.get("error")}
-
-    async def gatekeeper_review(self, task_id: str) -> dict:
-        """Uses role: gatekeeper_review."""
-        gk = self._get_worker("gatekeeper_review")
-        if not gk:
-            return {"error": "No worker for gatekeeper_review role"}
-
-        gk_name = self._get_worker_name("gatekeeper_review")
-        task = self.db.get_task(task_id)
-        threshold = self.config.get("quality_gates", {}).get("confidence_threshold", 0.90)
-
-        r = await gk.send_message(
-            f"Review task quality.\nTask: {(task or {}).get('description','')}\n"
-            f"Provide confidence 0.0-1.0 and APPROVED/REJECTED.\n"
-            f"Threshold: {threshold}"
-        )
-
-        if r.get("success"):
-            approved = "APPROVED" in r["response"].upper()
-            conf = 0.95 if approved else 0.75
-
-            self.db.request_write("insert", "quality_gates", {
-                "task_id": task_id, "gate_type": "gatekeeper",
-                "passed": approved, "confidence_score": conf,
-                "executed_by": gk_name,
-            })
-
-            if approved:
-                self.db.request_write("update", "tasks", {
-                    "_where": {"task_id": task_id}, "status": "approved"})
-                return {"verdict": "APPROVED", "confidence": conf, "by": gk_name}
-            else:
-                retry = (task or {}).get("retry_count", 0) or 0
-                if retry < 2:
-                    self.db.request_write("update", "tasks", {
-                        "_where": {"task_id": task_id},
-                        "status": "testing", "retry_count": retry + 1})
-                    return {"verdict": "REJECTED", "retry": retry + 1, "by": gk_name}
-                else:
-                    self.db.request_write("insert", "escalations", {
-                        "task_id": task_id, "escalation_type": "gatekeeper_rejection",
-                        "escalated_by": gk_name,
-                        "escalation_reason": "Rejected 2x",
-                        "status": "pending"})
-                    self.db.request_write("update", "tasks", {
-                        "_where": {"task_id": task_id}, "status": "blocked"})
-                    return {"verdict": "ESCALATED", "by": gk_name}
-        return {"error": "Review failed"}
 
     async def handle_escalation(self, esc_id: int, decision: str):
         self.db.request_write("update", "escalations", {
@@ -1265,11 +1174,1321 @@ class MasterOrchestrator:
 
     def _tdd_prompt(self, task, ctx):
         return (
-            f"Execute 12-step TDD protocol:\n\n"
+            f"Execute 13-step TDD protocol:\n\n"
             f"Task: {task.get('description','')}\nModule: {task.get('module','')}\n\n"
             f"Context:\n{ctx}\n\n"
             f"Steps: AC→TDE-RED→TDE-GREEN→BC→BF→SEA→DS→OA→VB→GIT→CL→CCP→AD"
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # AUTONOMOUS EXECUTION ENGINE
+    # Phases 0-5: Blueprint → Build → Test → Gate → Deploy
+    # ═══════════════════════════════════════════════════════════
+
+    async def execute_project(self, project_id: str,
+                               on_progress: Callable = None) -> dict:
+        """
+        Execute a full autonomous project lifecycle.
+
+        Phases:
+        0. Blueprint generation + audit + contract creation
+        1-3. Task planning + parallel execution + TDD + gates
+        4. Proto deploy + E2E tests
+        5. Production deploy
+
+        Args:
+            project_id: The project to execute
+            on_progress: Callback(phase, step, status, detail) for live updates
+
+        Returns:
+            {"success": bool, "phases_completed": int, "errors": []}
+        """
+        project = self.db.get_project(project_id)
+        if not project:
+            return {"success": False, "phases_completed": 0,
+                    "errors": [f"Project {project_id} not found"]}
+
+        project_path = project.get("project_path") or str(
+            self.working_dir / "projects" / project["name"].replace(" ", "_").lower()
+        )
+
+        # Initialize execution components
+        context_mgr = ContextManager(str(self.working_dir), self.db)
+        rules_engine = RulesEngine(self.db)
+        dac_tagger = DaCTagger(self.db)
+        learning_log = LearningLog(self.db)
+        git_mgr = GitManager(project_path)
+
+        errors = []
+        phases_completed = 0
+
+        try:
+            # ─── Phase 0: Blueprint ───
+            if on_progress:
+                await on_progress(0, "blueprint", "running", "Generating blueprint")
+
+            blueprint_result = await self._phase_blueprint(
+                project, project_path, context_mgr, rules_engine, on_progress
+            )
+            if not blueprint_result.get("approved"):
+                return {"success": False, "phases_completed": 0,
+                        "errors": ["Blueprint not approved"],
+                        "awaiting": "blueprint_approval",
+                        "project_path": project_path}
+
+            # Init git repo — abort if git fails (FER-AF-017)
+            if not git_mgr.init_repo():
+                logger.error(f"Git init failed for project {project_id} — aborting")
+                return {"success": False, "phases_completed": 0,
+                        "errors": ["Git repository initialization failed"],
+                        "project_path": project_path}
+            phases_completed = 0
+
+            # ─── Generate tasks from blueprint ───────────────────────────────
+            # Parse blueprint into concrete task rows in DB so _phase_build()
+            # finds real work to execute instead of skipping with "No tasks".
+            tasks_count = await self._generate_tasks_from_blueprint(
+                project, blueprint_result.get("blueprint", "")
+            )
+            if on_progress:
+                await on_progress(0, "task_gen", "running",
+                                  f"Generated {tasks_count} tasks across 3 phases")
+            logger.info(f"Task generation: {tasks_count} tasks created across 3 phases")
+
+            # ─── Phases 1-3: Build ───
+            total_phases = blueprint_result.get("total_phases", 3)
+            for phase_num in range(1, total_phases + 1):
+                if on_progress:
+                    await on_progress(phase_num, "planning", "running",
+                                     f"Phase {phase_num} planning")
+
+                phase_result = await self._phase_build(
+                    project, project_path, phase_num,
+                    context_mgr, rules_engine, dac_tagger,
+                    learning_log, git_mgr, on_progress
+                )
+
+                errors.extend(phase_result.get("errors", []))
+
+                # Only hard-stop if the phase produced ZERO completed tasks
+                # (i.e. nothing was built at all). Partial failures are expected
+                # and should not block subsequent phases.
+                if phase_result.get("tasks_completed", 0) == 0 and phase_result.get("tasks_failed", 0) > 0:
+                    logger.error(f"Phase {phase_num}: all tasks failed — stopping build")
+                    break
+
+                phases_completed = phase_num
+
+            # ─── Phase 4: Proto + CI/CD + E2E ───
+            if phases_completed >= total_phases:
+                if on_progress:
+                    await on_progress(4, "proto", "running", "Proto deployment")
+
+                git_mgr.tag_version(f"v0.{phases_completed}-proto")
+
+                # N/O: Generate CI/CD files (GH Actions, Dockerfile, docker-compose)
+                project_type = project.get("project_type", "web")
+                try:
+                    cicd = CICDGenerator(project_path)
+                    cicd_result = cicd.generate(project_type)
+                    logger.info(
+                        f"CI/CD generated: {len(cicd_result['files_created'])} files "
+                        f"for {project_type}"
+                    )
+                    if on_progress:
+                        await on_progress(
+                            4, "cicd", "running",
+                            f"CI/CD generated: {len(cicd_result['files_created'])} files",
+                        )
+                except Exception as _cicd_err:
+                    logger.error(f"CI/CD generation failed: {_cicd_err}")
+                    cicd_result = {"files_created": []}
+
+                # M: Auto-run E2E tests on generated project
+                e2e_result = await self._run_e2e_tests(project_path, on_progress)
+
+                # Update project status
+                self.db.request_write("update", "projects", {
+                    "current_phase": 4,
+                    "status": "active",
+                    "_where": {"project_id": project_id},
+                })
+
+                # FER-AF-010 FIX: Propagate E2E failure so dashboard can block UAT button.
+                e2e_failed = not e2e_result.get("success", True)
+
+                if e2e_failed:
+                    logger.warning(
+                        f"E2E tests failed for {project_id} — UAT approval is blocked until tests pass"
+                    )
+
+                # Pause for human UAT — blocked if E2E failed
+                return {
+                    "success": True,
+                    "phases_completed": phases_completed,
+                    "errors": errors,
+                    "awaiting": "uat_blocked_e2e" if e2e_failed else "uat_approval",
+                    "project_path": project_path,
+                    "e2e": e2e_result,
+                    "e2e_failed": e2e_failed,
+                    "cicd_files": cicd_result["files_created"],
+                }
+
+            # ─── Phase 5: Production ───
+            # Triggered separately after UAT approval
+
+        except Exception as e:
+            logger.error(f"Project execution failed: {e}", exc_info=True)
+            errors.append(str(e))
+
+        return {
+            "success": phases_completed > 0,
+            "phases_completed": phases_completed,
+            "errors": errors,
+            "project_path": project_path,
+        }
+
+    async def _phase_blueprint(self, project: dict, project_path: str,
+                                context_mgr: ContextManager,
+                                rules_engine: RulesEngine,
+                                on_progress: Callable = None) -> dict:
+        """Phase 0: Generate blueprint, dual audit, create contracts."""
+        project_id = project["project_id"]
+        project_type = project.get("project_type", "web")
+
+        # 0. Check if blueprint already approved — skip generation if so
+        existing = self.db.get_latest_blueprint(project_id)
+        if existing and existing.get("approved_by"):
+            logger.info(f"Blueprint already approved for {project_id} — skipping generation")
+            return {
+                "approved": True,
+                "blueprint": existing.get("blueprint_content", ""),
+                "version": existing.get("version", 1),
+                "total_phases": 3,
+            }
+
+        # 1. Generate blueprint
+        blueprint_worker = self._get_worker("blueprint_generation")
+        if not blueprint_worker:
+            return {"approved": False, "error": "No blueprint worker"}
+
+        protocol = context_mgr.load_protocol(project_type)
+        prompt = (
+            f"Generate a detailed software blueprint for:\n"
+            f"Project: {project['name']}\n"
+            f"Description: {project.get('description', '')}\n"
+            f"Type: {project_type}\n\n"
+            f"Protocol:\n{protocol}\n\n"
+            f"Include: architecture, phases (1-3), task breakdown, "
+            f"API endpoints, DB schema, types, tech stack."
+        )
+
+        result = await blueprint_worker.send_message(
+            prompt, system_prompt="Generate a comprehensive software blueprint"
+        )
+        if not result.get("success"):
+            return {"approved": False, "error": "Blueprint generation failed"}
+
+        blueprint_content = result["response"]
+
+        # 2. Dual audit: Kimi + Gemini
+        audit_result = await self._dual_audit_blueprint(
+            blueprint_content, project_type
+        )
+
+        # 3. Auto-revise if issues found (max 3 iterations)
+        revision = 0
+        while audit_result.get("issues") and revision < 3:
+            revision += 1
+            logger.info(f"Blueprint revision {revision}: {len(audit_result['issues'])} issues")
+
+            blueprint_content = await self._revise_blueprint(
+                blueprint_worker, blueprint_content, audit_result
+            )
+            audit_result = await self._dual_audit_blueprint(
+                blueprint_content, project_type
+            )
+
+        # 4. Save blueprint
+        self.db.request_write("insert", "blueprint_revisions", {
+            "project_id": project_id,
+            "version": revision + 1,
+            "blueprint_content": blueprint_content,
+            "changes_summary": f"v{revision + 1}: {len(audit_result.get('issues', []))} remaining issues",
+            "reason": "auto_generated",
+        })
+
+        # 5. Generate contracts
+        contract_gen = ContractGenerator(project_path)
+        contracts = await contract_gen.generate_from_blueprint(
+            blueprint_content, blueprint_worker
+        )
+
+        # 6. Kimi validates contracts
+        kimi = self._get_worker("gatekeeper_review")
+        if kimi:
+            validation = await contract_gen.validate_with_kimi(
+                kimi, blueprint_content
+            )
+            if not validation.get("valid"):
+                logger.warning(f"Contract validation issues: {validation.get('issues')}")
+
+        # 7. Generate rules file
+        rules_engine.generate_rules_file(project_path, project_type)
+
+        # 8. Create folder structure (via watchdog reference)
+        Path(project_path).mkdir(parents=True, exist_ok=True)
+
+        # Create a task row for the blueprint phase so escalation FK constraint is satisfied
+        self.db.request_write("insert", "tasks", {
+            "task_id": f"blueprint_{project_id}",
+            "project_id": project_id,
+            "phase": 0,
+            "module": "blueprint/approval",
+            "description": "Blueprint generation, audit, and human approval",
+            "status": "pending",
+        })
+
+        # Signal: waiting for human approval
+        self.db.request_write("insert", "escalations", {
+            "task_id": f"blueprint_{project_id}",
+            "escalation_type": "blueprint_approval",
+            "escalated_by": "orchestrator",
+            "escalation_reason": "Blueprint ready for human review and approval",
+            "context_data": json.dumps({
+                "blueprint_version": revision + 1,
+                "audit_issues": audit_result.get("issues", []),
+                "contracts_generated": bool(contracts.get("generated_files")),
+            }),
+            "status": "pending",
+        })
+
+        return {
+            "approved": False,  # Will be set to True via dashboard approval
+            "blueprint": blueprint_content,
+            "contracts": contracts,
+            "audit": audit_result,
+            "version": revision + 1,
+            "awaiting_approval": True,
+        }
+
+    async def _dual_audit_blueprint(self, blueprint: str,
+                                      project_type: str) -> dict:
+        """Dual audit: Kimi (gatekeeper) + Gemini (architecture)."""
+        issues = []
+
+        # Kimi audit
+        kimi = self._get_worker("gatekeeper_review")
+        if kimi:
+            # FER-AF-029: Increase truncation limit and warn when triggered
+            _bp_kimi = blueprint
+            if len(_bp_kimi) > 15_000:
+                logger.warning(
+                    f"Blueprint truncated {len(_bp_kimi)} → 15000 chars for Kimi completeness audit"
+                )
+                _bp_kimi = _bp_kimi[:15_000]
+            kimi_result = await kimi.send_message(
+                f"Review this {project_type} blueprint for completeness, "
+                f"feasibility, and potential issues:\n\n{_bp_kimi}",
+                system_prompt="Blueprint quality review"
+            )
+            if kimi_result.get("success"):
+                issues.append({"source": "kimi", "feedback": kimi_result["response"]})
+
+        # Gemini audit
+        gemini = self._get_worker("architecture_audit")
+        if gemini:
+            # FER-AF-029: Increase truncation limit and warn when triggered
+            _bp_gemini = blueprint
+            if len(_bp_gemini) > 15_000:
+                logger.warning(
+                    f"Blueprint truncated {len(_bp_gemini)} → 15000 chars for Gemini architecture audit"
+                )
+                _bp_gemini = _bp_gemini[:15_000]
+            gemini_result = await gemini.send_message(
+                f"Audit this {project_type} blueprint architecture for "
+                f"scalability, security, and best practices:\n\n{_bp_gemini}",
+                system_prompt="Architecture audit"
+            )
+            if gemini_result.get("success"):
+                issues.append({"source": "gemini", "feedback": gemini_result["response"]})
+
+        return {"issues": issues, "audited": True}
+
+    async def _revise_blueprint(self, worker, blueprint: str,
+                                  audit_result: dict) -> str:
+        """Auto-revise blueprint based on audit feedback."""
+        feedback = "\n".join(
+            f"[{i['source']}]: {i['feedback'][:1000]}"
+            for i in audit_result.get("issues", [])
+        )
+
+        # FER-AF-029: Increase truncation limit and warn when triggered
+        _bp_rev = blueprint
+        if len(_bp_rev) > 15_000:
+            logger.warning(
+                f"Blueprint truncated {len(_bp_rev)} → 15000 chars for revision prompt"
+            )
+            _bp_rev = _bp_rev[:15_000]
+        result = await worker.send_message(
+            f"Revise this blueprint based on audit feedback:\n\n"
+            f"BLUEPRINT:\n{_bp_rev}\n\n"
+            f"FEEDBACK:\n{feedback}",
+            system_prompt="Revise blueprint to address audit feedback"
+        )
+        return result.get("response", blueprint) if result.get("success") else blueprint
+
+    async def _classify_dependencies(self, tasks: list) -> dict:
+        """Ask Kimi to build a dependency graph for the given task list.
+
+        Returns {task_id: [dep_task_id, ...]} — all deps must complete before
+        the task starts.  Falls back to module-path heuristics when Kimi is
+        unavailable or returns unparseable output.
+        """
+        if not tasks:
+            return {}
+
+        task_ids = [t["task_id"] for t in tasks]
+
+        def _heuristic(t):
+            mod = t.get("module", "")
+            # Routers / views / controllers depend on models and DB modules
+            if any(x in mod for x in ("/routers/", "/views/", "/routes/", "/controllers/")):
+                return [o["task_id"] for o in tasks
+                        if o["task_id"] != t["task_id"] and
+                        any(k in o.get("module", "")
+                            for k in ("model", "database", "db", "schema"))]
+            # Tests depend on all non-test tasks
+            if mod.startswith("tests/") or "/tests/" in mod:
+                return [o["task_id"] for o in tasks
+                        if o["task_id"] != t["task_id"] and
+                        not (o.get("module", "").startswith("tests/") or
+                             "/tests/" in o.get("module", ""))]
+            # Entry-points depend on everything else
+            if mod.endswith(("main.py", "app.py", "index.ts", "index.tsx")):
+                return [o["task_id"] for o in tasks
+                        if o["task_id"] != t["task_id"] and
+                        not o.get("module", "").endswith(
+                            ("main.py", "app.py", "index.ts", "index.tsx"))]
+            return []
+
+        kimi = self._get_worker("gatekeeper_review")
+        if not kimi:
+            logger.info("No Kimi available — using module-path heuristics for dep graph")
+            return {t["task_id"]: _heuristic(t) for t in tasks}
+
+        task_list_str = "\n".join(
+            f"  {t['task_id']}: module={t.get('module', '')!r}, "
+            f"desc={t.get('description', '')[:80]!r}"
+            for t in tasks
+        )
+        example = (f'{{"{task_ids[0]}": [], '
+                   f'"{task_ids[1] if len(task_ids) > 1 else task_ids[0]}": '
+                   f'["{task_ids[0]}"]}}')
+        prompt = (
+            "Analyze these software tasks and identify dependencies.\n"
+            "Task B depends on task A if B imports from, extends, or requires "
+            "files that A creates.\n\n"
+            f"Tasks:\n{task_list_str}\n\n"
+            "Return ONLY a JSON object mapping each task_id to a list of "
+            "task_ids it depends on. Use [] for no dependencies. "
+            f"All task_ids must appear as keys.\nExample: {example}"
+        )
+        try:
+            result = await kimi.send_message(
+                prompt, system_prompt="Task dependency classification"
+            )
+            if result.get("success"):
+                m = re.search(r'\{[\s\S]*\}', result["response"])
+                if m:
+                    dep_graph = json.loads(m.group(0))
+                    valid = set(task_ids)
+                    return {
+                        tid: [d for d in deps if d in valid]
+                        for tid, deps in dep_graph.items()
+                        if tid in valid
+                    }
+        except Exception as exc:
+            logger.warning(f"Kimi dep classification failed ({exc}) — using heuristics")
+
+        return {t["task_id"]: _heuristic(t) for t in tasks}
+
+    async def _execute_single_task(
+        self, task: dict, project: dict, project_path: str,
+        context_mgr: "ContextManager", rules_engine: "RulesEngine",
+        dac_tagger: "DaCTagger", git_mgr: "GitManager",
+        on_progress: Callable = None,
+        learning_log: "LearningLog" = None,
+    ) -> dict:
+        """Execute one task through the full 13-step pipeline.
+
+        Returns {"success": bool, "task_id": str, "files": int,
+                 "tdd": bool, "gate": str, "error": str}
+        """
+        task_id = task["task_id"]
+        project_id = project["project_id"]
+        phase_num = task.get("phase", 0)
+
+        # Mark in_progress immediately so Watchdog stuck-task detection fires (FER-AF-042)
+        self.db.request_write("update", "tasks", {
+            "_where": {"task_id": task_id},
+            "status": "in_progress",
+            "current_step": "START",
+        })
+
+        if on_progress:
+            await on_progress(phase_num, task_id, "running",
+                             f"Executing: {task['description'][:50]}")
+
+        # FER-AF-006: Budget cap enforcement — check cost before running task
+        max_cost = getattr(self, "config", {}).get("cost_controls", {}).get(
+            "max_api_cost_per_project", 50.0
+        )
+        cost_rows = self.db.get_cost_summary(project_id)
+        total_spent = sum(row.get("total_cost", 0.0) or 0.0 for row in cost_rows)
+        if total_spent >= max_cost:
+            logger.warning(
+                f"Task {task_id} aborted: project {project_id} has exceeded budget "
+                f"(${total_spent:.4f} >= ${max_cost:.2f})"
+            )
+            self.db.request_write("update", "tasks", {
+                "_where": {"task_id": task_id},
+                "status": "failed",
+                "current_step": "BUDGET_EXCEEDED",
+            })
+            return {
+                "success": False,
+                "task_id": task_id,
+                "files": 0,
+                "tdd": False,
+                "gate": None,
+                "error": (
+                    f"Budget exceeded: project has spent ${total_spent:.4f} "
+                    f"which meets or exceeds the ${max_cost:.2f} cap"
+                ),
+            }
+
+        # 1. Git pull latest (async — serialised via _commit_lock, FER-AF-038)
+        _pull_result = git_mgr.pull_latest()
+        if hasattr(_pull_result, "__await__") or asyncio.iscoroutine(_pull_result):
+            await _pull_result
+
+        # 2. Kimi classifies complexity
+        complexity = await self._classify_task(task)
+
+        # 3. Role router assigns worker
+        module = task.get("module", "")
+        if module.startswith("frontend/components"):
+            role = "frontend_design"
+        elif complexity == "high":
+            role = "code_generation_complex"
+        else:
+            role = "code_generation_simple"
+
+        worker = self._get_worker(role)
+        if not worker:
+            return {"success": False, "task_id": task_id, "files": 0,
+                    "tdd": False, "gate": None,
+                    "error": f"No worker for role {role}"}
+
+        # 4. Build task prompt
+        prompt = context_mgr.build_task_prompt(task, project, project_path)
+
+        # FER-AF-003 FIX: Inject past learnings so workers benefit from prior
+        # failures.  Only non-empty results are appended to avoid prompt bloat.
+        if learning_log is not None:
+            learning_text = learning_log.inject_learnings(
+                task.get("description", ""),
+                project_type=project.get("project_type"),
+            )
+            if learning_text:
+                prompt = f"{prompt}\n\n{learning_text}"
+
+        # 5. Worker executes
+        worker_result = await worker.send_message(
+            prompt, system_prompt=f"Execute task {task_id}"
+        )
+
+        # Issue 4: Wire cost tracking — queue token counts after every worker call (R12)
+        try:
+            tokens = worker_result.get("tokens", {})
+            prompt_tok = tokens.get("prompt", 0)
+            comp_tok = tokens.get("completion", 0)
+            from orchestration.database import queue_write as _qw
+            _qw(operation="insert", table="cost_tracking", params={
+                "task_id": task_id, "project_id": project_id,
+                "worker": self._get_worker_name(role), "operation": "task_execution",
+                "prompt_tokens": prompt_tok, "completion_tokens": comp_tok,
+                "total_tokens": prompt_tok + comp_tok,
+                "elapsed_ms": worker_result.get("elapsed_ms"),
+            }, requester="orchestrator")
+        except Exception as _ce:
+            logger.warning(f"Cost tracking write failed (non-fatal): {_ce}")
+
+        if not worker_result.get("success"):
+            dac_tagger.tag(task_id, "worker_crash",
+                           f"Worker {role} failed on task",
+                           source_worker=self._get_worker_name(role),
+                           project_id=project_id)
+            return {"success": False, "task_id": task_id, "files": 0,
+                    "tdd": False, "gate": None, "error": "Worker failed"}
+
+        # 6. Parse structured output
+        parser = OutputParser(project_path)
+        task_module = task.get("module")
+        summary, violations = parser.parse_and_apply(
+            worker_result["response"], task_id,
+            worker_name=self._get_worker_name(role),
+            task_module=task_module,
+        )
+        if violations:
+            logger.warning(f"Task {task_id}: retrying due to violations")
+            # Build a targeted retry message: call out scope violations explicitly
+            scope_viols = [
+                v for v in violations
+                if v.get("violation_tag") == "TRAP"
+                and "out_of_scope_write" in v.get("detail", "")
+            ]
+            if scope_viols:
+                allowed_prefix = parser._get_allowed_prefix(task_module) or task_module
+                viol_lines = "\n".join(
+                    f"  - OUT OF SCOPE: You wrote '{v['path']}' but your module is "
+                    f"'{task_module}'. ONLY write files under '{v['allowed_prefix']}'."
+                    for v in scope_viols
+                )
+                retry_prompt = (
+                    f"{prompt}\n\n"
+                    f"SCOPE VIOLATIONS — previous attempt wrote files outside your module:\n"
+                    f"{viol_lines}\n"
+                    f"Redo the task writing ONLY files under '{allowed_prefix}'."
+                )
+            else:
+                retry_prompt = prompt + "\n\nPREVIOUS ATTEMPT HAD ISSUES. Return VALID JSON."
+            retry = await worker.send_message(
+                retry_prompt,
+                system_prompt=f"Retry task {task_id} — must return valid structured JSON"
+            )
+            if retry.get("success"):
+                summary, violations = parser.parse_and_apply(
+                    retry["response"], task_id,
+                    worker_name=self._get_worker_name(role),
+                    task_module=task_module,
+                )
+
+        # --- FER-AF-012: Abort task if TRAP violations persist after retry ---
+        # TRAP = worker violated module-scope boundaries. Files are already
+        # skipped by OutputParser, but we must also abort the task so broken
+        # code never enters the codebase or triggers the quality gate.
+        persistent_traps = [
+            v for v in violations
+            if v.get("violation_tag") == "TRAP" or v.get("tag_type") == "TRAP"
+        ]
+        if persistent_traps:
+            trap_path = persistent_traps[0].get("path", "unknown file")
+            logger.error(
+                f"Task {task_id}: TRAP scope violation persists after retry — "
+                f"aborting task. File: {trap_path!r}"
+            )
+            dac_tagger.tag(task_id, "trap_abort",
+                           f"TRAP abort: scope violation on {trap_path}",
+                           source_worker=self._get_worker_name(role),
+                           project_id=project_id)
+            self.db.request_write("update", "tasks", {
+                "_where": {"task_id": task_id},
+                "status": "failed", "current_step": "TRAP",
+            })
+            return {
+                "success": False,
+                "task_id": task_id,
+                "files": 0,
+                "tdd": False,
+                "gate": None,
+                "error": f"TRAP: scope violation — {trap_path}",
+            }
+
+        # 7. Contract validation
+        validator = ContractValidator(project_path)
+        if validator.load_contracts():
+            code_files = [{"path": f["path"], "content": f.get("content", "")}
+                          for f in summary.get("files_written", [])
+                          if f.get("action") != "deleted"]
+            for cf in code_files:
+                fp = Path(project_path) / cf["path"]
+                if fp.exists():
+                    try:
+                        cf["content"] = fp.read_text()
+                    except IOError:
+                        pass
+            val_result = validator.validate(code_files)
+            if not val_result["valid"]:
+                for mismatch in val_result["mismatches"]:
+                    dac_tagger.tag(task_id, "contract_violation",
+                                   f"{mismatch['type']}: {mismatch['detail']}",
+                                   project_id=project_id)
+
+        # 8. Rules check
+        rules_engine.check_automated_rules(
+            task_id, {"files": summary.get("files_written", [])}
+        )
+
+        # 9. TDD Pipeline
+        tdd = TDDPipeline(self.db, self.router, git_mgr, project_path=project_path)
+        files_with_content = []
+        for fw in summary.get("files_written", []):
+            entry = {"path": fw["path"], "action": fw.get("action", ""),
+                     "size": fw.get("size", 0), "content": ""}
+            fp = Path(project_path) / fw["path"]
+            if fp.exists():
+                try:
+                    entry["content"] = fp.read_text(errors="replace")[:5000]
+                except IOError:
+                    pass
+            files_with_content.append(entry)
+        parsed_output = {"files": files_with_content,
+                         "decisions": summary.get("decisions_logged", [])}
+
+        tdd_result = await tdd.execute(
+            task, project, parsed_output, on_progress=on_progress
+        )
+
+        # 10. DaC tagging from TDD
+        dac_tagger.tag_from_tdd_result(task_id, tdd_result, project_id)
+
+        # 11. Kimi quality gate (with retry loop)
+        gate_result = await self._quality_gate(
+            task, parsed_output, project_path, validator
+        )
+        rejection_count = 0
+        while gate_result.get("verdict") == "REJECTED" and rejection_count < 2:
+            rejection_count += 1
+            dac_tagger.tag_gate_rejection(
+                task_id, rejection_count, gate_result, project_id
+            )
+            retry = await worker.send_message(
+                prompt + f"\n\nPREVIOUS ATTEMPT REJECTED: {gate_result.get('issues', [])}",
+                system_prompt=f"Retry task {task_id} — address gate feedback"
+            )
+            if retry.get("success"):
+                summary, _ = parser.parse_and_apply(
+                    retry["response"], task_id,
+                    worker_name=self._get_worker_name(role),
+                    task_module=task_module,
+                )
+                gate_result = await self._quality_gate(
+                    task, parsed_output, project_path, validator
+                )
+
+        succeeded = gate_result.get("verdict") != "REJECTED"
+        if succeeded:
+            self.db.request_write("update", "tasks", {
+                "_where": {"task_id": task_id},
+                "status": "approved", "current_step": "AD",
+            })
+        else:
+            dac_tagger.tag(task_id, "double_rejection",
+                           f"Task rejected {rejection_count + 1}x by gatekeeper",
+                           project_id=project_id)
+            self.db.request_write("update", "tasks", {
+                "_where": {"task_id": task_id},
+                "status": "failed", "current_step": "AD",
+            })
+
+        # 12. Git commit (async — serialised via _commit_lock to prevent index.lock races)
+        await git_mgr.atomic_commit(task_id, f"Complete: {task['description'][:50]}")
+
+        # Phi3 summary
+        if self.phi3:
+            await self.phi3.queue_summary(
+                f"[AUTO] Task {task_id}: {task['description'][:100]}",
+                f"Result: {'success' if succeeded else 'failed'}. "
+                f"Files: {len(summary.get('files_written', []))}. "
+                f"TDD: {tdd_result.get('success')}",
+                self.session_id, persist_full=True
+            )
+
+        return {
+            "success": succeeded,
+            "task_id": task_id,
+            "files": len(summary.get("files_written", [])),
+            "tdd": tdd_result.get("success"),
+            "gate": gate_result.get("verdict"),
+            "error": "" if succeeded else "Gate rejected",
+        }
+
+    async def _phase_build(self, project: dict, project_path: str,
+                            phase_num: int, context_mgr: "ContextManager",
+                            rules_engine: "RulesEngine", dac_tagger: "DaCTagger",
+                            learning_log: "LearningLog", git_mgr: "GitManager",
+                            on_progress: Callable = None) -> dict:
+        """Execute a single build phase (1-3) with dependency-aware parallel tasks."""
+        project_id = project["project_id"]
+
+        # FER-AF-016 FIX: Verify git state before touching any tasks.
+        # Detached HEAD causes cryptic failures mid-build; surface it early.
+        git_state = git_mgr.verify_state()
+        if not git_state.get("ok"):
+            issue = git_state.get("issue", "unknown git state problem")
+            logger.error(f"Phase {phase_num}: aborting — git state invalid: {issue}")
+            return {"success": False, "error": f"git state invalid: {issue}",
+                    "tasks_completed": 0}
+
+        # Create phase branch
+        branch = git_mgr.create_phase_branch(phase_num, f"phase-{phase_num}")
+
+        # Load rules
+        rules_engine.load_rules(project_path)
+
+        # Get tasks for this phase
+        tasks = self.db.get_tasks_by_phase(project_id, phase_num)
+        if not tasks:
+            logger.warning(f"No tasks for phase {phase_num}")
+            return {"success": True, "tasks_completed": 0}
+
+        # Build dependency graph via Kimi (or heuristic fallback)
+        logger.info(
+            f"Phase {phase_num}: classifying dependencies for {len(tasks)} tasks"
+        )
+        dep_graph = await self._classify_dependencies(tasks)
+        logger.info(f"Phase {phase_num}: dep graph = {dep_graph}")
+
+        completed_task_ids: set = set()
+        failed_tasks: list = []
+        task_results: dict = {}
+        pending = {t["task_id"]: t for t in tasks}
+
+        while pending:
+            # Find tasks whose dependencies are all satisfied
+            ready = [
+                t for tid, t in pending.items()
+                if all(dep in completed_task_ids for dep in dep_graph.get(tid, []))
+            ]
+            if not ready:
+                # Deadlock: run the first pending task to unblock
+                logger.warning(
+                    f"Phase {phase_num}: dependency deadlock among "
+                    f"{list(pending.keys())} — running first task to unblock"
+                )
+                ready = [next(iter(pending.values()))]
+
+            logger.info(
+                f"Phase {phase_num}: wave — running {len(ready)} task(s) in parallel: "
+                f"{[t['task_id'] for t in ready]}"
+            )
+
+            # Execute this wave concurrently — semaphore limits concurrency (FER-AF-036)
+            async def _guarded(task):
+                async with self._task_semaphore:
+                    return await self._execute_single_task(
+                        task, project, project_path,
+                        context_mgr, rules_engine, dac_tagger, git_mgr, on_progress,
+                        learning_log=learning_log,
+                    )
+
+            wave_results = await asyncio.gather(
+                *[_guarded(t) for t in ready],
+                return_exceptions=True,
+            )
+
+            for task, result in zip(ready, wave_results):
+                tid = task["task_id"]
+                del pending[tid]
+                if isinstance(result, Exception):
+                    logger.error(f"Task {tid} raised exception: {result}")
+                    failed_tasks.append({"task_id": tid, "error": str(result)})
+                    task_results[tid] = {"success": False, "error": str(result)}
+                elif result.get("success"):
+                    completed_task_ids.add(tid)
+                    task_results[tid] = result
+                else:
+                    failed_tasks.append({
+                        "task_id": tid,
+                        "error": result.get("error", "Unknown"),
+                    })
+                    task_results[tid] = result
+
+        # Phase complete
+        if failed_tasks:
+            logger.warning(f"Phase {phase_num}: {len(failed_tasks)} failed tasks")
+
+        # Kimi phase PR review
+        kimi = self._get_worker("gatekeeper_review")
+        if kimi:
+            changed = git_mgr.get_changed_files("develop")
+            await kimi.send_message(
+                f"Review phase {phase_num} changes for merge to develop:\n"
+                f"Files changed: {changed[:20]}\n"
+                f"Tasks completed: {len(completed_task_ids)}/{len(tasks)}",
+                system_prompt="Phase PR review"
+            )
+
+        # F: Conflict detection before merge (plan Decision #25)
+        conflicts = git_mgr.check_conflicts("develop")
+        if conflicts:
+            logger.warning(
+                f"Phase {phase_num}: {len(conflicts)} conflict(s) before merge: {conflicts}"
+            )
+            dac_tagger.tag(
+                f"phase_{phase_num}_merge",
+                "merge_conflict",
+                f"Phase {phase_num}: {branch} → develop conflicts in: "
+                f"{', '.join(conflicts[:10])}",
+                source_step="phase_merge",
+                project_id=project_id,
+            )
+
+        # FER-AF-040: Serialise merge_to_develop across concurrent phases
+        async with self._merge_lock:
+            git_mgr.merge_to_develop(branch, f"Phase {phase_num} complete")
+
+        # Update project phase
+        self.db.request_write("update", "projects", {
+            "current_phase": phase_num,
+            "_where": {"project_id": project["project_id"]},
+        })
+
+        return {
+            "success": len(failed_tasks) == 0,
+            "tasks_completed": len(completed_task_ids),
+            "tasks_failed": len(failed_tasks),
+            "task_results": task_results,
+            "errors": [f["error"] for f in failed_tasks],
+        }
+
+    async def _run_e2e_tests(self, project_path: str,
+                              on_progress: Callable = None) -> dict:
+        """
+        M: Auto-run E2E tests on the generated project (phase 4).
+        Runs pytest on tests/ directory. Non-blocking; failure does not block UAT.
+        Returns result summary dict.
+        """
+        if on_progress:
+            await on_progress(4, "e2e", "running", "Running E2E tests...")
+
+        tests_dir = Path(project_path) / "tests"
+        if not tests_dir.exists() or not any(tests_dir.iterdir()):
+            logger.warning("E2E: no tests/ directory or empty — skipping")
+            if on_progress:
+                await on_progress(4, "e2e", "skipped", "No tests found — skipping E2E")
+            return {"success": True, "skipped": True, "reason": "No tests/ directory"}
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "python", "-m", "pytest", "tests/", "-v", "--tb=short", "-q",
+                cwd=str(project_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=300  # 5-min hard cap
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("E2E tests timed out (300s)")
+                if on_progress:
+                    await on_progress(4, "e2e", "timeout", "E2E tests timed out")
+                return {"success": False, "error": "Tests timed out after 300s"}
+
+            passed = proc.returncode == 0
+            output_tail = stdout.decode(errors="replace")[-2000:]
+            status = "passed" if passed else "failed"
+            msg = f"E2E {status.upper()} (exit {proc.returncode})"
+            logger.info(msg)
+            if on_progress:
+                await on_progress(4, "e2e", status, msg)
+            return {
+                "success": passed,
+                "returncode": proc.returncode,
+                "output_tail": output_tail,
+            }
+
+        except FileNotFoundError:
+            # pytest not installed in project env — skip gracefully
+            logger.warning("E2E: pytest not found — skipping")
+            if on_progress:
+                await on_progress(4, "e2e", "skipped", "pytest not found — skipping E2E")
+            return {"success": True, "skipped": True, "reason": "pytest not found"}
+        except Exception as e:
+            logger.error(f"E2E test runner error: {e}")
+            if on_progress:
+                await on_progress(4, "e2e", "error", f"E2E error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _generate_tasks_from_blueprint(
+        self, project: dict, blueprint_content: str
+    ) -> int:
+        """
+        Parse blueprint with LLM and create task rows in DB for each phase.
+        Called once after blueprint approval. Returns count of tasks created.
+        """
+        import re as _re
+        project_id = project["project_id"]
+        project_type = project.get("project_type", "web")
+
+        logger.info(f"Generating tasks from blueprint for {project_id}")
+
+        worker = self._get_worker("task_planning_gsd")
+        phases_data = None
+
+        if worker:
+            # FER-AF-029: Increase truncation limit and warn when triggered
+            _bp_tg = blueprint_content
+            if len(_bp_tg) > 15_000:
+                logger.warning(
+                    f"Blueprint truncated {len(_bp_tg)} → 15000 chars for task generation"
+                )
+                _bp_tg = _bp_tg[:15_000]
+            prompt = (
+                f"You are a senior software architect. Analyze this {project_type} "
+                f"project blueprint and generate a concrete task breakdown.\n\n"
+                f"BLUEPRINT:\n{_bp_tg}\n\n"
+                f"Return ONLY valid JSON (no markdown, no explanation):\n"
+                f'{{\n'
+                f'  "phases": [\n'
+                f'    {{\n'
+                f'      "phase": 1,\n'
+                f'      "name": "Backend",\n'
+                f'      "tasks": [\n'
+                f'        {{"module": "backend/database.py", "description": "Setup SQLite database with tables from db_schema.sql"}},\n'
+                f'        {{"module": "backend/models.py", "description": "Pydantic models matching types.json"}},\n'
+                f'        {{"module": "backend/routers/books.py", "description": "FastAPI CRUD endpoints"}},\n'
+                f'        {{"module": "backend/main.py", "description": "FastAPI app entry point with CORS and routing"}}\n'
+                f'      ]\n'
+                f'    }},\n'
+                f'    {{"phase": 2, "name": "Frontend", "tasks": ['
+                f'{{"module": "frontend/src/App.tsx", "description": "React app root"}}'
+                f']}},\n'
+                f'    {{"phase": 3, "name": "Integration", "tasks": ['
+                f'{{"module": "tests/test_api.py", "description": "API integration tests"}}'
+                f']}}\n'
+                f'  ]\n'
+                f'}}\n\n'
+                f"Generate 4-8 tasks per phase. Modules must be relative paths. "
+                f"Descriptions must be specific and actionable based on the blueprint."
+            )
+            result = await worker.send_message(
+                prompt,
+                system_prompt=(
+                    "Return ONLY valid JSON with the task breakdown. "
+                    "No markdown fences, no extra text before or after JSON."
+                ),
+            )
+            if result.get("success"):
+                response = result["response"].strip()
+                # Strip markdown code fences if present
+                if "```" in response:
+                    parts = response.split("```")
+                    for part in parts:
+                        part = part.strip()
+                        if part.startswith("json"):
+                            part = part[4:].strip()
+                        if part.startswith("{"):
+                            response = part
+                            break
+                try:
+                    phases_data = json.loads(response)
+                except json.JSONDecodeError:
+                    # Try to extract JSON object from response
+                    m = _re.search(r'\{[\s\S]*\}', response)
+                    if m:
+                        try:
+                            phases_data = json.loads(m.group())
+                        except json.JSONDecodeError:
+                            logger.warning("Task LLM returned unparseable JSON — using fallback")
+                    else:
+                        logger.warning("Task LLM returned no JSON — using fallback")
+
+        # Fallback: use sensible defaults if LLM failed
+        if not phases_data or "phases" not in phases_data:
+            logger.warning(f"Using fallback task definitions for {project_id}")
+            phases_data = self._fallback_tasks(project)
+
+        # Queue all task inserts
+        tasks_created = 0
+        for phase_info in phases_data.get("phases", []):
+            phase_num = int(phase_info.get("phase", 1))
+            for i, task_info in enumerate(phase_info.get("tasks", []), 1):
+                task_id = f"{project_id}_p{phase_num}_t{i:02d}"
+                module = task_info.get("module", f"phase{phase_num}/task{i}.py")
+                description = task_info.get("description", f"Phase {phase_num} task {i}")
+                try:
+                    self.db.request_write("insert", "tasks", {
+                        "task_id": task_id,
+                        "project_id": project_id,
+                        "phase": phase_num,
+                        "module": module,
+                        "description": description,
+                        "status": "pending",
+                    })
+                    tasks_created += 1
+                except RuntimeError as e:
+                    logger.error(f"Failed to queue task {task_id}: {e}")
+
+        # Poll until tasks are actually visible in DB (Watchdog drain is async).
+        # FER-AF-037: Reduced from range(20) to range(10) — 10s is sufficient.
+        for attempt in range(10):
+            await asyncio.sleep(1)
+            confirmed = self.db.get_tasks_by_phase(project_id, 1)
+            if confirmed:
+                logger.info(
+                    f"Task generation confirmed in DB after {attempt + 1}s "
+                    f"({len(confirmed)} phase-1 tasks visible)"
+                )
+                break
+        else:
+            logger.warning(
+                f"Tasks not visible in DB after 10s — Watchdog may be lagging"
+            )
+
+        logger.info(f"Task generation complete: {tasks_created} tasks created for {project_id}")
+        return tasks_created
+
+    def _fallback_tasks(self, project: dict) -> dict:
+        """Default task breakdown when LLM task planning fails or returns bad JSON."""
+        return {
+            "phases": [
+                {
+                    "phase": 1,
+                    "name": "Backend",
+                    "tasks": [
+                        {"module": "backend/database.py",
+                         "description": "Setup SQLite database with all tables from db_schema.sql contracts"},
+                        {"module": "backend/models.py",
+                         "description": "Pydantic request/response models matching types.json contracts"},
+                        {"module": "backend/routers/books.py",
+                         "description": "FastAPI CRUD: GET/POST /api/books, GET/PUT/DELETE /api/books/{id}"},
+                        {"module": "backend/routers/search.py",
+                         "description": "FastAPI search and filter: GET /api/books/search, GET /api/books/filter"},
+                        {"module": "backend/auth.py",
+                         "description": "JWT token creation, verification, and Bearer middleware"},
+                        {"module": "backend/main.py",
+                         "description": "FastAPI app entry: CORS, router registration, lifespan, health check"},
+                    ],
+                },
+                {
+                    "phase": 2,
+                    "name": "Frontend",
+                    "tasks": [
+                        {"module": "frontend/src/api/client.ts",
+                         "description": "Axios HTTP client with auth headers and error handling"},
+                        {"module": "frontend/src/types/index.ts",
+                         "description": "TypeScript types: Book, User, BookFilter matching types.json contracts"},
+                        {"module": "frontend/src/components/BookCard.tsx",
+                         "description": "Book card: title, author, genre, 1-5 star rating, status badge"},
+                        {"module": "frontend/src/components/BookForm.tsx",
+                         "description": "Add/Edit book form with validation: title, author, genre, rating, notes, status"},
+                        {"module": "frontend/src/components/BookList.tsx",
+                         "description": "Book list with search bar, genre/author filter dropdowns, pagination"},
+                        {"module": "frontend/src/App.tsx",
+                         "description": "React Router: /, /books, /books/:id routes with Tailwind layout"},
+                    ],
+                },
+                {
+                    "phase": 3,
+                    "name": "Integration",
+                    "tasks": [
+                        {"module": "tests/test_books_api.py",
+                         "description": "pytest: CRUD, search, filter, auth for books API endpoints"},
+                        {"module": "tests/test_auth.py",
+                         "description": "pytest: login, register, token refresh, protected route access"},
+                        {"module": "requirements.txt",
+                         "description": "Python deps: fastapi, uvicorn, sqlalchemy, pydantic, python-jose, passlib"},
+                        {"module": "frontend/package.json",
+                         "description": "Node deps: react, react-router-dom, axios, tailwindcss, typescript, vite"},
+                    ],
+                },
+            ]
+        }
+
+    async def _classify_task(self, task: dict) -> str:
+        """Kimi classifies task complexity (CALL #1)."""
+        kimi = self._get_worker("gatekeeper_review")
+        if not kimi:
+            return "low"
+
+        result = await kimi.send_message(
+            f"Classify this task complexity as 'low' or 'high':\n"
+            f"Module: {task['module']}\n"
+            f"Description: {task['description'][:500]}",
+            system_prompt="Classify task complexity: respond with ONLY 'low' or 'high'"
+        )
+        if result.get("success"):
+            resp = result["response"].strip().lower()
+            return "high" if "high" in resp else "low"
+        return "low"
+
+    async def _quality_gate(self, task: dict, code_output: dict,
+                             project_path: str,
+                             validator: ContractValidator = None) -> dict:
+        """
+        Quality gate review — logic-based verdict (Issue 5, R2).
+        APPROVED only when issue_count == 0 AND dac_tags == [].
+        Confidence score is telemetry only, never the decision gate.
+
+        Kimi SPOF fix (Issue 3, R6): health-checks Kimi first;
+        falls back to Gemini (architecture_audit role) if Kimi offline.
+        """
+        import re
+
+        # --- Issue 3: Kimi health check → Gemini fallback ---
+        gate_worker = self._get_worker("gatekeeper_review")
+        gate_worker_name = self._get_worker_name("gatekeeper_review")
+
+        if gate_worker:
+            try:
+                health = await gate_worker.check_health()
+                if health in ("offline", "crashed"):
+                    logger.warning(
+                        f"Gatekeeper '{gate_worker_name}' is {health} — "
+                        "falling back to Gemini (architecture_audit)"
+                    )
+                    gate_worker = self._get_worker("architecture_audit")
+                    gate_worker_name = self._get_worker_name("architecture_audit")
+            except Exception as _he:
+                logger.warning(f"Health check failed for {gate_worker_name}: {_he}")
+
+        if not gate_worker:
+            logger.error("No gate worker available — REJECTING task (cannot auto-approve without gatekeeper)")
+            return {
+                "verdict": "REJECTED",
+                "confidence": 0.0,
+                "issues": ["No gate worker available; manual review required before approval"],
+                "dac_tags": [],
+                "by": "none",
+            }
+
+        context_mgr = ContextManager(str(self.working_dir), self.db)
+        contracts = context_mgr.load_contracts(project_path)
+
+        prompt = context_mgr.build_gate_prompt(
+            task, code_output, contracts,
+            validator_report={"valid": True, "mismatches": []} if not validator else {}
+        )
+
+        result = await gate_worker.send_message(prompt, system_prompt="Quality gate review")
+
+        if result.get("success"):
+            gate = {}
+            parse_failed = False
+            try:
+                resp = result["response"]
+                json_match = re.search(r'\{[\s\S]*\}', resp)
+                if json_match:
+                    gate = json.loads(json_match.group())
+                else:
+                    parse_failed = True
+            except (json.JSONDecodeError, AttributeError):
+                parse_failed = True
+
+            # --- FER-AF-044: If gate LLM returned no parseable JSON, REJECT ---
+            # An empty/unstructured response must never silently APPROVE a task.
+            if not gate or parse_failed:
+                logger.warning(
+                    f"Gate worker '{gate_worker_name}' returned no parseable JSON — "
+                    f"REJECTING task (raw response snippet: {result.get('response', '')[:200]!r})"
+                )
+                return {
+                    "verdict": "REJECTED",
+                    "confidence": 0.0,
+                    "issues": ["Gate LLM returned no parseable JSON — manual review required"],
+                    "dac_tags": [],
+                    "by": gate_worker_name,
+                }
+
+            # --- Issue 5: Logic-based verdict, not confidence-based ---
+            issues = gate.get("issues", [])
+            dac_tags = gate.get("dac_tags", [])
+
+            # Normalise: empty string entries don't count as real issues
+            real_issues = [i for i in issues if i and str(i).strip()]
+            real_tags = [t for t in dac_tags if t and str(t).strip()]
+
+            if real_issues or real_tags:
+                verdict = "REJECTED"
+            else:
+                # Also respect explicit REJECTED from the LLM even without issues listed
+                raw_verdict = gate.get("verdict", "").upper()
+                verdict = "REJECTED" if raw_verdict == "REJECTED" else "APPROVED"
+
+            return {
+                "verdict": verdict,
+                "confidence": gate.get("confidence", 0.5),  # telemetry only
+                "issues": real_issues,
+                "dac_tags": real_tags,
+                "by": gate_worker_name,
+            }
+
+        # Worker call failed — REJECT, never silently approve
+        logger.error(
+            f"Gate worker '{gate_worker_name}' call failed — REJECTING task "
+            f"(result: {result})"
+        )
+        return {
+            "verdict": "REJECTED",
+            "confidence": 0.0,
+            "issues": [f"Gate worker '{gate_worker_name}' call failed; manual review required"],
+            "dac_tags": [],
+            "by": gate_worker_name,
+        }
+
+    async def approve_blueprint(self, project_id: str) -> dict:
+        """Called from dashboard when human approves blueprint."""
+        project = self.db.get_project(project_id)
+        if not project:
+            return {"success": False, "error": "Project not found"}
+
+        # Mark blueprint as approved — use wait to ensure DB write completes
+        # before execute_project is re-launched (which reads approved_by to skip regen).
+        latest = self.db.get_latest_blueprint(project_id)
+        if latest:
+            # P1 FIX: Use fire-and-forget request_write — not request_write_and_wait.
+            # request_write_and_wait blocks until Watchdog drains the queue; in tests
+            # (and any environment without a running Watchdog) it times out after 10s.
+            self.db.request_write("update", "blueprint_revisions", {
+                "approved_by": "HUMAN",
+                "approved_at": datetime.now().isoformat(),
+                "_where": {"project_id": project_id, "version": latest["version"]},
+            })
+
+        # Lock contracts
+        project_path = project.get("project_path", "")
+        if project_path:
+            contract_gen = ContractGenerator(project_path)
+            contract_gen.lock_contracts()
+
+        logger.info(f"Blueprint approved for project {project_id}")
+        return {"success": True, "message": "Blueprint approved, contracts locked"}
+
+    async def approve_uat(self, project_id: str) -> dict:
+        """Called from dashboard when human approves UAT."""
+        project = self.db.get_project(project_id)
+        if not project:
+            return {"success": False, "error": "Project not found"}
+
+        # FER-AF-010: Block UAT approval when E2E tests failed
+        if project.get("e2e_failed"):
+            return {
+                "success": False,
+                "error": "UAT blocked: E2E tests failed. Fix tests before approving.",
+            }
+
+        project_path = project.get("project_path", "")
+        git_mgr = GitManager(project_path)
+
+        # Phase 5: merge to main
+        git_mgr.merge_to_main("Production release — UAT approved")
+        git_mgr.tag_version("v1.0.0", "Production release")
+
+        # Update project
+        self.db.request_write("update", "projects", {
+            "status": "completed",
+            "current_phase": 5,
+            "_where": {"project_id": project_id},
+        })
+
+        logger.info(f"UAT approved, production deployed for {project_id}")
+        return {"success": True, "message": "Production deployed, v1.0.0 tagged"}
 
 
 BLUEPRINT_SYSTEM = (
@@ -1279,7 +2498,7 @@ BLUEPRINT_SYSTEM = (
 )
 
 TDD_SYSTEM = (
-    "You are a TDD engineer. Follow 12-step protocol precisely: "
+    "You are a TDD engineer. Follow 13-step protocol precisely: "
     "AC, TDE-RED, TDE-GREEN, BC, BF, SEA, DS, OA, VB, GIT, CL, CCP, AD. "
     "Report each step."
 )

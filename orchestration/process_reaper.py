@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -240,7 +241,7 @@ class ProcessReaper:
                     logger.error(f"  {proc.name}: CRITICAL - escalating before kill")
                     report["ghosts_killed"].append(f"{proc.name} (CRITICAL, escalated)")
                 else:
-                    self._force_kill(pid)
+                    await asyncio.to_thread(self._force_kill, pid)
                     report["ghosts_killed"].append(proc.name)
                     pids_to_remove.append(pid)
                     await self._kill_children(proc.name, report)
@@ -254,7 +255,7 @@ class ProcessReaper:
                         f"  {proc.name} (PID {pid}): ORPHAN - "
                         f"parent '{proc.parent_name}' is dead"
                     )
-                    self._force_kill(pid)
+                    await asyncio.to_thread(self._force_kill, pid)
                     report["orphans_killed"].append(proc.name)
                     pids_to_remove.append(pid)
                     continue
@@ -283,7 +284,7 @@ class ProcessReaper:
             child_pid = self.name_to_pid.get(child_name)
             if child_pid and self._is_pid_alive(child_pid):
                 logger.warning(f"  Killing orphan child: {child_name} (PID {child_pid})")
-                self._force_kill(child_pid)
+                await asyncio.to_thread(self._force_kill, child_pid)
                 report["orphans_killed"].append(child_name)
 
     # ========================================
@@ -336,7 +337,7 @@ class ProcessReaper:
             for proc in procs:
                 if proc.is_alive:
                     logger.warning(f"  Force-killing: {proc.name} (PID {proc.pid})")
-                    self._force_kill(proc.pid)
+                    await asyncio.to_thread(self._force_kill, proc.pid)
 
         # Final zombie reap
         self._reap_zombies()
@@ -391,11 +392,11 @@ class ProcessReaper:
                     proc.subprocess_ref.kill()
                     await proc.subprocess_ref.wait()
             except Exception:
-                pass
+                logger.debug(f"Process {pid} cleanup failed", exc_info=True)
 
         # Force if still alive
         if self._is_pid_alive(pid):
-            self._force_kill(pid)
+            await asyncio.to_thread(self._force_kill, pid)
 
         self.unregister(name)
 
@@ -411,17 +412,23 @@ class ProcessReaper:
             return False
 
     def _force_kill(self, pid: int):
-        """SIGKILL with PGID fallback for stubborn processes."""
+        """SIGKILL with PGID fallback for stubborn processes.
+
+        Must be called via asyncio.to_thread() from async contexts so it runs
+        in a thread pool and does NOT block the event loop.
+        Uses threading.Event.wait() for cooperative waits between signal checks.
+        """
+        _wait = threading.Event().wait
         try:
             # First try SIGTERM
             os.kill(pid, signal.SIGTERM)
-            time.sleep(0.5)
+            _wait(0.5)
 
             # Check if dead
             if self._is_pid_alive(pid):
                 # SIGKILL
                 os.kill(pid, signal.SIGKILL)
-                time.sleep(0.2)
+                _wait(0.2)
 
             # If STILL alive, try process group kill
             if self._is_pid_alive(pid):
@@ -430,7 +437,7 @@ class ProcessReaper:
                     if pgid != self._factory_pgid:
                         os.killpg(pgid, signal.SIGKILL)
                 except Exception:
-                    pass
+                    logger.debug(f"Process group kill for {pid} failed", exc_info=True)
 
         except (ProcessLookupError, PermissionError):
             pass  # Already dead

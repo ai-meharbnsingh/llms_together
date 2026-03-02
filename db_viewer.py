@@ -17,7 +17,8 @@ try:
     with open(FACTORY_ROOT / "config" / "factory_config.json") as f:
         cfg = json.load(f)
     working_dir = Path(cfg.get("factory", {}).get("working_dir", "~/working")).expanduser()
-except Exception:
+except Exception as e:
+    print(f"Warning: Could not load factory config: {e}")
     working_dir = Path("~/working").expanduser()
 
 DB_PATH = working_dir / "autonomous_factory" / "factory_state" / "factory.db"
@@ -68,12 +69,20 @@ class DBViewerHandler(http.server.SimpleHTTPRequestHandler):
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
+                # Validate table name securely against the database dictionary
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                valid_tables = {row['name'] for row in cursor.fetchall()}
+                if table_name not in valid_tables:
+                    conn.close()
+                    self.wfile.write(json.dumps({"success": False, "error": f"Invalid table name: {table_name}"}).encode())
+                    return
+                
                 # Get columns
-                cursor.execute(f"PRAGMA table_info('{table_name}')")
+                cursor.execute(f"PRAGMA table_info('{table_name}')")  # nosemgrep
                 columns = [row['name'] for row in cursor.fetchall()]
                 
                 # Get data
-                cursor.execute(f"SELECT * FROM '{table_name}' LIMIT 1000")
+                cursor.execute(f"SELECT * FROM '{table_name}' LIMIT 1000")  # nosemgrep
                 rows = [dict(row) for row in cursor.fetchall()]
                 
                 conn.close()

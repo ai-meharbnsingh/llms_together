@@ -128,8 +128,35 @@ class Phi3Instance:
                 self._queue.get_nowait()
                 self._queue.put_nowait(req)
             except Exception:
-                pass
+                logger.warning(f"Phi3 queue overflow — dropped summary for {chat_id}")
         return chat_id
+
+    def queue_execution_summary(self, task_id: str, phase: int, tdd_step: str,
+                                 worker: str, prompt_preview: str,
+                                 response_preview: str, project_id: str = None):
+        """
+        Queue a summary for autonomous execution events.
+        Extends the standard queue_summary with rich execution metadata.
+
+        Every worker call during autonomous execution gets Phi3 summary.
+        Feeds: DoC (crash recovery) + chat_summaries (audit) + training_data context.
+        """
+        user_query = (
+            f"[EXEC] task={task_id} phase={phase} step={tdd_step} "
+            f"worker={worker}: {prompt_preview[:200]}"
+        )
+        llm_response = response_preview[:500]
+
+        # Queue with execution metadata
+        self.queue_summary(
+            user_query=user_query,
+            llm_response=llm_response,
+            session_id=f"exec_{project_id or 'unknown'}",
+            persist_full=True,
+            project_id=project_id,
+            task_id=task_id,
+            phase=phase,
+        )
 
     async def _loop(self):
         while self.alive:

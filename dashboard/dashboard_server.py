@@ -1,11 +1,14 @@
 """
-Dashboard Server v1.3 — Web UI with Role Switching + Multi-Mode Chat Panel.
+Dashboard Server v1.5 — Web UI with Role Switching + Multi-Mode Chat Panel + Project Execution.
 READ-ONLY DB. Writes + role swaps via bus/router -> Watchdog.
 
 Chat modes:
   - Orchestrator: routes to MasterOrchestrator.handle_message() (intent routing)
   - Direct: user picks any configured worker model, sends raw message
   - Project: user picks worker, message gets project context prepended
+
+M4 (v1.5): Project execution dashboard — launch, progress timeline, TDD step bar,
+blueprint approval modal, UAT panel, live WebSocket events.
 """
 
 import asyncio
@@ -96,6 +99,7 @@ class DashboardServer:
         self.watchdog = None
         self._runner = None
         self._current_chat_task = None  # asyncio.Task for in-progress chat (cancellable)
+        self._running_projects = {}  # project_id -> asyncio.Task for execute_project()
 
     def set_role_router(self, router: RoleRouter):
         self.role_router = router
@@ -134,6 +138,18 @@ class DashboardServer:
         r.add_get("/api/projects", self._api_projects)
         r.add_post("/api/projects/select", self._api_project_select)
         r.add_post("/api/projects/create", self._api_project_create)
+        # M4: Project execution endpoints
+        r.add_post("/api/projects/launch", self._api_project_launch)
+        r.add_get("/api/projects/{id}/progress", self._api_project_progress)
+        r.add_get("/api/projects/{id}/blueprint", self._api_project_blueprint)
+        r.add_post("/api/projects/{id}/approve-blueprint", self._api_approve_blueprint)
+        r.add_post("/api/projects/{id}/approve-uat", self._api_approve_uat)
+        r.add_delete("/api/projects/{id}", self._api_project_delete)
+        # Issue 7: Training data validation endpoint (G3)
+        r.add_post("/api/training-data/{id}/validate", self._api_validate_training_data)
+        # Config endpoints
+        r.add_post("/api/config/mode", self._api_config_mode)
+        r.add_get("/api/config/mode", self._api_config_mode_get)
         # Chat session endpoints
         r.add_get("/api/chat/sessions", self._api_chat_sessions)
         r.add_post("/api/chat/sessions/new", self._api_chat_session_new)
@@ -149,9 +165,15 @@ class DashboardServer:
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
+        try:
+            await site.start()
+        except OSError as e:
+            raise RuntimeError(
+                f"Dashboard port {self.port} is already in use. "
+                "Stop the existing process or change 'dashboard.port' in factory_config.json."
+            ) from e
         logger.info(f"Dashboard: http://{self.host}:{self.port}")
-        asyncio.create_task(self._broadcast())
+        self._broadcast_task = asyncio.create_task(self._broadcast())
 
     async def stop(self):
         """Graceful shutdown -- close WebSockets and runner."""
@@ -159,23 +181,36 @@ class DashboardServer:
             try:
                 await ws.close()
             except Exception:
-                pass
+                logger.debug("WebSocket close failed during shutdown", exc_info=True)
         self.ws_clients.clear()
+        if hasattr(self, "_broadcast_task") and self._broadcast_task:
+            self._broadcast_task.cancel()
+            try:
+                await self._broadcast_task
+            except asyncio.CancelledError:
+                pass
+        
         if self._runner:
             await self._runner.cleanup()
             logger.info("Dashboard stopped")
 
     async def _broadcast(self):
         while True:
-            if self.ws_clients:
-                data = json.dumps(self._full_status(), default=str)
-                dead = set()
-                for ws in self.ws_clients:
-                    try:
-                        await ws.send_str(data)
-                    except Exception:
-                        dead.add(ws)
-                self.ws_clients -= dead
+            try:
+                if self.ws_clients:
+                    data = json.dumps(self._full_status(), default=str)
+                    dead = set()
+                    for ws in self.ws_clients:
+                        try:
+                            await ws.send_str(data)
+                        except Exception:
+                            logger.debug("WebSocket send failed, marking dead", exc_info=True)
+                            dead.add(ws)
+                    self.ws_clients -= dead
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Broadcast error (recovering): {e}")
             await asyncio.sleep(self.refresh_ms / 1000)
 
     def _full_status(self):
@@ -255,6 +290,43 @@ class DashboardServer:
                             if self.orchestrator:
                                 self.orchestrator.update_discussion_participants(
                                     cmd.get("participants", []))
+                        # M4: Project execution via WS
+                        elif action == "launch_project" and self.orchestrator:
+                            pid = cmd.get("project_id", "")
+                            project = self.db.get_project(pid)
+                            if not project:
+                                await ws.send_str(json.dumps({"event": "project_error", "error": "Project not found"}))
+                            elif pid in self._running_projects and not self._running_projects[pid].done():
+                                await ws.send_str(json.dumps({"event": "project_error", "error": "Already running"}))
+                            else:
+                                t = asyncio.create_task(
+                                    self.orchestrator.execute_project(pid, on_progress=self._on_project_progress))
+                                self._running_projects[pid] = t
+                                t.add_done_callback(lambda _t, _pid=pid: asyncio.create_task(self._on_execute_complete(_t, _pid)))
+                                await ws.send_str(json.dumps({"event": "project_launched", "project_id": pid}))
+                        elif action == "approve_blueprint" and self.orchestrator:
+                            pid = cmd.get("project_id", "")
+                            result = await self.orchestrator.approve_blueprint(pid)
+                            if result.get("success"):
+                                await self._broadcast_to_all(json.dumps({
+                                    "event": "blueprint_approved", "project_id": pid,
+                                    "timestamp": datetime.now().isoformat()}))
+                                # Re-launch execute_project to continue with phases 1-3
+                                t = asyncio.create_task(
+                                    self.orchestrator.execute_project(pid, on_progress=self._on_project_progress))
+                                self._running_projects[pid] = t
+                                t.add_done_callback(lambda _t, _pid=pid: asyncio.create_task(self._on_execute_complete(_t, _pid)))
+                            else:
+                                await ws.send_str(json.dumps({"event": "project_error", "error": result.get("error", "Failed")}))
+                        elif action == "approve_uat" and self.orchestrator:
+                            pid = cmd.get("project_id", "")
+                            result = await self.orchestrator.approve_uat(pid)
+                            if result.get("success"):
+                                await self._broadcast_to_all(json.dumps({
+                                    "event": "uat_approved", "project_id": pid,
+                                    "timestamp": datetime.now().isoformat()}))
+                            else:
+                                await ws.send_str(json.dumps({"event": "project_error", "error": result.get("error", "Failed")}))
                     except Exception as e:
                         logger.error(f"WS command error: {e}")
         finally:
@@ -460,6 +532,7 @@ class DashboardServer:
             try:
                 await ws.send_str(data)
             except Exception:
+                logger.debug("WebSocket broadcast send failed", exc_info=True)
                 dead.add(ws)
         self.ws_clients -= dead
 
@@ -836,6 +909,271 @@ class DashboardServer:
             logger.error(f"Project create error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
+    # --- M4: Project Execution REST APIs ---
+
+    async def _api_project_launch(self, req):
+        """POST /api/projects/launch -- start execute_project() as background task."""
+        if not self.orchestrator:
+            return web.json_response({"error": "Orchestrator not connected"}, status=503)
+        body = await req.json()
+        project_id = body.get("project_id", "").strip()
+        if not project_id:
+            return web.json_response({"error": "Missing project_id"}, status=400)
+
+        project = self.db.get_project(project_id)
+        if not project:
+            return web.json_response({"error": "Project not found"}, status=404)
+
+        if project_id in self._running_projects:
+            task = self._running_projects[project_id]
+            if not task.done():
+                return web.json_response({"error": "Project already running"}, status=409)
+
+        # Immediately notify UI that project has started — don't wait for WS poll
+        await self._broadcast_to_all(json.dumps({
+            "event": "project_launched",
+            "project_id": project_id,
+            "timestamp": datetime.now().isoformat(),
+        }))
+
+        task = asyncio.create_task(
+            self.orchestrator.execute_project(project_id, on_progress=self._on_project_progress)
+        )
+        self._running_projects[project_id] = task
+        task.add_done_callback(lambda t, _pid=project_id: asyncio.create_task(self._on_execute_complete(t, _pid)))
+
+        return web.json_response({
+            "started": True, "project_id": project_id,
+            "message": "Project execution started"
+        })
+
+    async def _api_project_progress(self, req):
+        """GET /api/projects/{id}/progress -- fetch phase/step/tasks/bugs for project."""
+        project_id = req.match_info["id"]
+        project = self.db.get_project(project_id)
+        if not project:
+            return web.json_response({"error": "Project not found"}, status=404)
+
+        current_phase = project.get("current_phase", 0)
+        task_stats = self.db.get_task_stats(project_id)
+
+        # Get tasks for current phase
+        phase_tasks = []
+        if hasattr(self.db, "get_tasks_by_phase"):
+            phase_tasks = self.db.get_tasks_by_phase(project_id, current_phase)
+
+        # Get escalations for this project
+        escalations = [
+            e for e in self.db.get_pending_escalations(20)
+            if e.get("context_data") and project_id in str(e.get("context_data", ""))
+        ]
+
+        # Check if running
+        is_running = (
+            project_id in self._running_projects
+            and not self._running_projects[project_id].done()
+        )
+
+        return web.json_response({
+            "project_id": project_id,
+            "name": project.get("name"),
+            "status": project.get("status"),
+            "current_phase": current_phase,
+            "task_stats": task_stats,
+            "phase_tasks": [
+                {
+                    "task_id": t.get("task_id"),
+                    "description": t.get("description"),
+                    "status": t.get("status"),
+                    "current_step": t.get("current_step"),
+                    "dac_tag": t.get("dac_tag"),
+                }
+                for t in phase_tasks
+            ],
+            "escalations": escalations,
+            "is_running": is_running,
+        })
+
+    async def _api_project_blueprint(self, req):
+        """GET /api/projects/{id}/blueprint -- fetch latest blueprint + contracts."""
+        project_id = req.match_info["id"]
+        project = self.db.get_project(project_id)
+        if not project:
+            return web.json_response({"error": "Project not found"}, status=404)
+
+        blueprint = self.db.get_latest_blueprint(project_id)
+        contracts = {}
+        project_path = project.get("project_path", "")
+        if project_path:
+            import os
+            contracts_dir = os.path.join(project_path, "contracts")
+            for fname in ("api_contract.json", "db_schema.sql", "types.json"):
+                fpath = os.path.join(contracts_dir, fname)
+                if os.path.exists(fpath):
+                    with open(fpath, "r") as f:
+                        contracts[fname] = f.read()
+
+        return web.json_response({
+            "blueprint": {
+                "version": blueprint.get("version") if blueprint else None,
+                "content": blueprint.get("blueprint_content") if blueprint else None,
+                "approved_by": blueprint.get("approved_by") if blueprint else None,
+                "approved_at": blueprint.get("approved_at") if blueprint else None,
+            } if blueprint else None,
+            "contracts": contracts,
+        })
+
+    async def _api_approve_blueprint(self, req):
+        """POST /api/projects/{id}/approve-blueprint -- human blueprint approval."""
+        if not self.orchestrator:
+            return web.json_response({"error": "Orchestrator not connected"}, status=503)
+        project_id = req.match_info["id"]
+        result = await self.orchestrator.approve_blueprint(project_id)
+        if result.get("success"):
+            await self._broadcast_to_all(json.dumps({
+                "event": "blueprint_approved",
+                "project_id": project_id,
+                "timestamp": datetime.now().isoformat(),
+            }))
+            # Re-launch execute_project to continue with phases 1-3
+            t = asyncio.create_task(
+                self.orchestrator.execute_project(project_id, on_progress=self._on_project_progress))
+            self._running_projects[project_id] = t
+            t.add_done_callback(lambda _t, _pid=project_id: asyncio.create_task(self._on_execute_complete(_t, _pid)))
+        return web.json_response(result)
+
+    async def _api_approve_uat(self, req):
+        """POST /api/projects/{id}/approve-uat -- human UAT approval -> production deploy."""
+        if not self.orchestrator:
+            return web.json_response({"error": "Orchestrator not connected"}, status=503)
+        project_id = req.match_info["id"]
+        result = await self.orchestrator.approve_uat(project_id)
+        if result.get("success"):
+            await self._broadcast_to_all(json.dumps({
+                "event": "uat_approved",
+                "project_id": project_id,
+                "timestamp": datetime.now().isoformat(),
+            }))
+        return web.json_response(result)
+
+    async def _api_validate_training_data(self, req):
+        """POST /api/training-data/{id}/validate — set validated=True (Issue 7/G3)."""
+        training_id = int(req.match_info["id"])
+        if not self.watchdog:
+            return web.json_response({"error": "Watchdog not connected"}, status=503)
+        ok = self.watchdog.validate_training_data(training_id)
+        return web.json_response({"success": ok, "training_id": training_id})
+
+    async def _on_execute_complete(self, task: asyncio.Task, project_id: str):
+        """Shared done-callback for execute_project tasks — broadcasts blueprint_ready / uat_ready."""
+        try:
+            result = task.result()
+            awaiting = result.get("awaiting")
+            if awaiting == "blueprint_approval":
+                await self._broadcast_to_all(json.dumps({
+                    "event": "blueprint_ready",
+                    "project_id": project_id,
+                    "timestamp": datetime.now().isoformat(),
+                }))
+            elif awaiting == "uat_approval":
+                # Issue 1: Include e2e_passed so dashboard can show red warning (R4/R10/M4)
+                e2e = result.get("e2e", {})
+                e2e_passed = e2e.get("success", True) and not e2e.get("skipped", False)
+                await self._broadcast_to_all(json.dumps({
+                    "event": "uat_ready",
+                    "project_id": project_id,
+                    "phases_completed": result.get("phases_completed", 0),
+                    "e2e_passed": e2e_passed,
+                    "e2e_output": e2e.get("output_tail", "")[:500],
+                    "timestamp": datetime.now().isoformat(),
+                }))
+        except Exception as e:
+            logger.error(f"Project execution error ({project_id}): {e}")
+            await self._broadcast_to_all(json.dumps({
+                "event": "project_error",
+                "project_id": project_id,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+            }))
+
+    async def _on_project_progress(self, phase: int, step: str, status: str, detail: str):
+        """Progress callback invoked by execute_project() for live dashboard updates."""
+        tdd_steps = {"AC", "RED", "GREEN", "BC", "BF", "SEA", "DS", "OA", "VB", "GIT", "CL", "CCP", "AD"}
+        event_name = "tdd_step_update" if step.upper() in tdd_steps else "project_progress"
+        await self._broadcast_to_all(json.dumps({
+            "event": event_name,
+            "phase": phase,
+            "step": step,
+            "status": status,
+            "detail": detail,
+            "timestamp": datetime.now().isoformat(),
+        }))
+
+    async def _api_project_delete(self, req):
+        """DELETE /api/projects/{id} -- delete project and all its data."""
+        project_id = req.match_info["id"]
+        project = self.db.get_project(project_id)
+        if not project:
+            return web.json_response({"error": "Project not found"}, status=404)
+
+        # Cancel any running task first
+        if project_id in self._running_projects:
+            task = self._running_projects[project_id]
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            del self._running_projects[project_id]
+
+        # Delete project and all FK-dependent rows
+        try:
+            if self.watchdog and hasattr(self.watchdog, "db"):
+                rows = self.watchdog.db.delete_project(project_id)
+                if rows == 0:
+                    logger.warning(f"delete_project({project_id}) affected 0 rows")
+            else:
+                return web.json_response({"error": "Watchdog not available"}, status=503)
+        except Exception as e:
+            logger.error(f"Project delete DB error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+        await self._broadcast_to_all(json.dumps({
+            "event": "project_deleted",
+            "project_id": project_id,
+            "timestamp": datetime.now().isoformat(),
+        }))
+        return web.json_response({"success": True, "project_id": project_id})
+
+    async def _api_config_mode(self, req):
+        """POST /api/config/mode -- toggle local LLM test mode.
+        Body: {"mode": "local"} or {"mode": "production"}
+        """
+        if not self.role_router:
+            return web.json_response({"error": "Role router not connected"}, status=503)
+        body = await req.json()
+        mode = body.get("mode", "").lower()
+        if mode not in ("local", "production"):
+            return web.json_response(
+                {"error": "mode must be 'local' or 'production'"}, status=400
+            )
+        result = self.role_router.set_local_mode(mode == "local")
+        if not result.get("success"):
+            return web.json_response(result, status=400)
+
+        await self._broadcast_to_all(json.dumps({
+            "event": "mode_changed",
+            "local_mode": result["local_mode"],
+            "timestamp": datetime.now().isoformat(),
+        }))
+        return web.json_response(result)
+
+    async def _api_config_mode_get(self, req):
+        """GET /api/config/mode -- get current mode."""
+        local_mode = self.role_router.is_local_mode if self.role_router else False
+        return web.json_response({"local_mode": local_mode})
+
     async def _api_chat_search(self, req):
         """GET /api/chat/search?q=keyword&worker=qwen&limit=20 — search Phi3 summaries."""
         q = req.query.get("q", "").strip()
@@ -870,7 +1208,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Autonomous Factory -- Dashboard v1.4</title>
+<title>Autonomous Factory -- Dashboard v1.5</title>
 <style>
 :root{--bg:#0a0e17;--panel:#111827;--border:#1e293b;--text:#e2e8f0;--dim:#64748b;
 --green:#22c55e;--yellow:#eab308;--red:#ef4444;--blue:#3b82f6;--orange:#f97316;--cyan:#06b6d4;--purple:#a855f7}
@@ -1102,6 +1440,57 @@ min-width:70px;align-self:flex-end}
 .chat-input button.project-btn{background:var(--orange)}
 .typing-indicator{font-size:11px;color:var(--dim);padding:4px 0;display:none}
 .typing-indicator.show{display:block}
+
+/* --- M4: Project Progress Timeline --- */
+.project-timeline{display:flex;flex-direction:column;gap:2px;margin-bottom:8px}
+.phase-step{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:4px;
+font-size:11px;transition:background .2s}
+.phase-step.active{background:#0c2d48}
+.phase-step.completed{opacity:0.7}
+.phase-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;border:2px solid var(--border)}
+.phase-dot.pending{border-color:var(--dim)}
+.phase-dot.running{border-color:var(--blue);background:var(--blue);animation:p 1.5s infinite}
+.phase-dot.completed{border-color:var(--green);background:var(--green)}
+.phase-dot.failed{border-color:var(--red);background:var(--red)}
+.phase-dot.awaiting{border-color:var(--yellow);background:var(--yellow);animation:p 1s infinite}
+.phase-label{flex:1;color:var(--text)}
+.phase-status{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+
+/* --- M4: TDD Step Bar --- */
+.tdd-bar{display:flex;gap:1px;margin:8px 0;flex-wrap:wrap}
+.tdd-step{padding:3px 6px;font-size:9px;border-radius:3px;background:#1e293b;color:var(--dim);
+text-transform:uppercase;letter-spacing:0.5px;transition:all .3s}
+.tdd-step.running{background:var(--blue);color:white}
+.tdd-step.completed{background:#052e16;color:var(--green)}
+.tdd-step.failed{background:#3b0000;color:var(--red)}
+
+/* --- M4: Blueprint Modal --- */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);
+z-index:200;display:flex;align-items:center;justify-content:center}
+.modal-box{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+width:80%;max-width:800px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-box h2{padding:16px 20px;border-bottom:1px solid var(--border);font-size:14px;
+color:var(--cyan);letter-spacing:1px;flex-shrink:0}
+.modal-body{flex:1;overflow-y:auto;padding:20px;font-size:12px;line-height:1.6;scrollbar-width:thin}
+.modal-body::-webkit-scrollbar{width:5px}
+.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.modal-actions{display:flex;gap:8px;padding:12px 20px;border-top:1px solid var(--border);flex-shrink:0}
+.modal-actions .btn{padding:8px 20px;font-size:12px}
+.contract-section{margin-top:16px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px}
+.contract-section h3{font-size:11px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.contract-section pre{font-size:11px;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+
+/* --- M4: UAT Panel --- */
+.uat-panel{padding:12px;background:#1a1a2e;border:1px solid var(--yellow);border-radius:6px;margin-top:8px}
+.uat-panel .uat-title{font-size:12px;color:var(--yellow);font-weight:bold;margin-bottom:8px}
+.uat-panel .uat-info{font-size:11px;color:var(--dim);margin-bottom:10px}
+
+/* --- M4: Launch Button --- */
+.launch-btn{padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;
+color:var(--green);cursor:pointer;font-size:11px;font-family:inherit;transition:all .2s}
+.launch-btn:hover{background:var(--green);color:var(--bg)}
+.launch-btn:disabled{opacity:0.4;cursor:not-allowed}
+.launch-btn.running{border-color:var(--blue);color:var(--blue);animation:p 1.5s infinite}
 </style>
 </head>
 <body>
@@ -1109,7 +1498,7 @@ min-width:70px;align-self:flex-end}
 
 <!-- Header -->
 <div class="hdr">
-<h1>AUTONOMOUS FACTORY v1.4</h1>
+<h1>AUTONOMOUS FACTORY v1.5 <span id="localModeBadge" style="display:none;background:#eab308;color:#000;font-size:10px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle;font-weight:700;letter-spacing:1px">LOCAL MODE</span></h1>
 <div class="m"><span id="pn">--</span> | <span id="lu">--</span></div>
 </div>
 
@@ -1155,6 +1544,22 @@ min-width:70px;align-self:flex-end}
 <div class="pnl-body" id="al"></div>
 </div>
 
+<!-- M4: Project Progress -->
+<div class="pnl" id="pnl-progress" style="display:none">
+<h2 onclick="togglePanel('pnl-progress')">Project Progress</h2>
+<div class="pnl-body">
+<div class="project-timeline" id="projectTimeline"></div>
+<div class="tdd-bar" id="tddBar"></div>
+<div id="progressBugs"></div>
+<div id="uatPanel" class="uat-panel" style="display:none">
+<div class="uat-title">Proto Ready -- Awaiting UAT Approval</div>
+<div id="e2eWarning" style="display:none;background:#ff4444;color:#fff;padding:10px 14px;border-radius:4px;margin-bottom:10px;font-weight:bold">⚠️ E2E TESTS FAILED — do not approve until failures are investigated!</div>
+<div class="uat-info">All build phases complete. Test the proto deployment before approving production release.</div>
+<button class="btn ap" onclick="approveUAT()" style="padding:8px 20px;font-size:12px">Approve &amp; Deploy to Production</button>
+</div>
+</div>
+</div>
+
 </div><!-- /sidebar -->
 
 <!-- Resize Handle -->
@@ -1198,6 +1603,7 @@ min-width:70px;align-self:flex-end}
 <option value="">-- No Project --</option>
 </select>
 <button class="proj-new-btn" onclick="createProjectModal()">+ New</button>
+<button class="launch-btn" id="launchBtn" onclick="launchProject()" style="display:none">Launch</button>
 </div>
 
 <!-- Chat Messages -->
@@ -1318,12 +1724,19 @@ function escHtml(s){const d=document.createElement('div');d.textContent=s;return
 function conn(){
 const p=location.protocol==='https:'?'wss:':'ws:';
 ws=new WebSocket(`${p}//${location.host}/ws`);
-ws.onopen=()=>{document.getElementById('cs').className='cs c';document.getElementById('cs').textContent='Connected';loadChatHistory();loadWorkers();loadProjects()};
+ws.onopen=()=>{document.getElementById('cs').className='cs c';document.getElementById('cs').textContent='Connected';loadChatHistory();loadWorkers();loadProjects();if(currentProjectId)loadProjectProgress();
+fetch('/api/config/mode').then(r=>r.json()).then(d=>{const badge=document.getElementById('localModeBadge');if(badge)badge.style.display=d.local_mode?'':'none';}).catch(()=>{})};
 ws.onclose=()=>{document.getElementById('cs').className='cs d';document.getElementById('cs').textContent='Disconnected';setTimeout(conn,3000)};
 ws.onerror=()=>ws.close();
 ws.onmessage=e=>{try{
 const d=JSON.parse(e.data);
 if(d.event==='role_swapped'){showSaveNote();return}
+if(d.event==='mode_changed'){
+const badge=document.getElementById('localModeBadge');
+if(badge)badge.style.display=d.local_mode?'':'none';
+appendChat('system',d.local_mode?'LOCAL TEST MODE enabled — all roles using local LLMs (DeepSeek/Qwen).':'Production mode restored — online AI models active.');
+return}
+if(d.event==='project_deleted'){if(d.project_id===currentProjectId){currentProjectId=null;}loadProjects();return}
 if(d.event==='project_selected'){loadProjects();loadChatHistory();return}
 if(d.event==='session_changed'){loadSessions();loadChatHistory();return}
 if(d.event==='chat_message'){
@@ -1340,6 +1753,55 @@ document.getElementById('chatBtn').disabled=false;
 return}
 if(d.event==='chat_stopped'){hideTyping();return}
 if(d.event==='chat_error'){hideTyping();appendChat('system',d.error);return}
+// M4: Project execution events
+if(d.event==='project_launched'){
+appendChat('system','Project execution started. Phase 0: Blueprint generating...');
+showProgressPanel();
+renderTimeline(0,'running');
+const btn=document.getElementById('launchBtn');
+if(btn){btn.textContent='Running';btn.classList.add('running');btn.disabled=true;}
+return}
+if(d.event==='project_progress'){
+projectProgress.phase=d.phase;projectProgress.step=d.step;
+renderTimeline(d.phase,d.status);
+return}
+if(d.event==='tdd_step_update'){
+projectProgress.phase=d.phase;projectProgress.step=d.step;
+if(d.status==='completed')projectProgress.tddSteps[d.step.toUpperCase()]='completed';
+else if(d.status==='failed')projectProgress.tddSteps[d.step.toUpperCase()]='failed';
+renderTimeline(d.phase,'running');
+renderTddBar(d.status==='running'?d.step.toUpperCase():null);
+return}
+if(d.event==='blueprint_ready'){
+showBlueprintModal();
+renderTimeline(0,'awaiting');
+return}
+if(d.event==='blueprint_approved'){
+closeBlueprintModal();
+appendChat('system','Blueprint approved. Contracts locked. Starting build phases...');
+projectProgress.tddSteps={};
+renderTddBar(null);
+return}
+if(d.event==='uat_ready'){
+document.getElementById('uatPanel').style.display='';
+renderTimeline(4,'awaiting');
+// Issue 1: Show e2e_warning banner if E2E failed (R4/R10/M4)
+var e2eWarningEl=document.getElementById('e2eWarning');
+if(e2eWarningEl){e2eWarningEl.style.display=d.e2e_passed===false?'':'none';}
+appendChat('system','Proto deployment ready. Awaiting UAT approval.'+(d.e2e_passed===false?' ⚠️ E2E TESTS FAILED — review before approving!':''));
+return}
+if(d.event==='uat_approved'){
+document.getElementById('uatPanel').style.display='none';
+renderTimeline(5,'completed');
+const btn=document.getElementById('launchBtn');
+btn.textContent='Completed';btn.classList.remove('running');btn.disabled=true;
+appendChat('system','UAT approved. Production deployed. v1.0.0 tagged.');
+return}
+if(d.event==='project_error'){
+appendChat('system','Project error: '+(d.error||'Unknown'));
+const btn=document.getElementById('launchBtn');
+btn.textContent='Launch';btn.classList.remove('running');btn.disabled=false;
+return}
 upd(d);
 }catch(x){}}}
 
@@ -1370,11 +1832,24 @@ tq.innerHTML+=`<div class="tb"><span class="l">${k.replace('_',' ')}: ${n}</span
 // Escalations
 const ed=document.getElementById('es');const el=d.escalations||[];
 if(!el.length){ed.innerHTML='<span style="color:var(--dim)">None</span>'}
-else{ed.innerHTML=el.map(e=>`<div class="ei"><div class="t">${e.escalation_type}</div>
+else{ed.innerHTML=el.map(e=>{
+// M4: Special rendering for blueprint/UAT escalations
+if(e.escalation_type==='blueprint_approval'){
+return `<div class="ei"><div class="t" style="color:var(--cyan)">Blueprint Approval Required</div>
+<div class="r">${e.escalation_reason||'Blueprint generated and audited.'}</div>
+<div class="a"><button class="btn ap" onclick="showBlueprintModal()">Review Blueprint</button>
+<button class="btn rj" onclick="res(${e.escalation_id},'dismissed')">Dismiss</button></div></div>`}
+if(e.escalation_type==='uat_approval'){
+return `<div class="ei"><div class="t" style="color:var(--yellow)">UAT Approval Required</div>
+<div class="r">${e.escalation_reason||'Proto deployment ready for testing.'}</div>
+<div class="a"><button class="btn ap" onclick="approveUAT()">Approve &amp; Deploy</button>
+<button class="btn rj" onclick="res(${e.escalation_id},'dismissed')">Dismiss</button></div></div>`}
+return `<div class="ei"><div class="t">${e.escalation_type}</div>
 <div class="r">${e.escalation_reason}</div>
 <div style="font-size:10px;color:var(--dim)">Task: ${e.task_id}</div>
 <div class="a"><button class="btn ap" onclick="res(${e.escalation_id},'approved')">Approve</button>
-<button class="btn rj" onclick="res(${e.escalation_id},'dismissed')">Dismiss</button></div></div>`).join('')}
+<button class="btn rj" onclick="res(${e.escalation_id},'dismissed')">Dismiss</button></div></div>`
+}).join('')}
 
 // Activity
 const ad=document.getElementById('al');
@@ -1718,17 +2193,36 @@ const sel=document.getElementById('projectSel');
 const prev=currentProjectId;
 currentProjectId=d.current_project||null;
 sel.innerHTML='<option value="">-- No Project --</option>';
+let selectedProject=null;
 (d.projects||[]).forEach(p=>{
 const opt=document.createElement('option');
 opt.value=p.project_id;
 opt.textContent=p.name+' ['+p.status+']';
-if(p.project_id===currentProjectId)opt.selected=true;
+if(p.project_id===currentProjectId){opt.selected=true;selectedProject=p}
 sel.appendChild(opt);
 });
+// M4: Show/hide launch button based on project state
+const btn=document.getElementById('launchBtn');
+if(selectedProject&&selectedProject.status==='active'){
+btn.style.display='';
+if(currentProjectId in (window._runningProjects||{})){
+btn.textContent='Running';btn.classList.add('running');btn.disabled=true;
+}else{
+btn.textContent='Launch';btn.classList.remove('running');btn.disabled=false;
+}
+loadProjectProgress();
+}else{
+btn.style.display='none';
+document.getElementById('pnl-progress').style.display='none';
+}
 }).catch(()=>{})}
 
 function selectProject(){
 const pid=document.getElementById('projectSel').value||null;
+currentProjectId=pid;
+// Reset progress state on project change
+projectProgress={phase:0,step:'',tddSteps:{}};
+document.getElementById('uatPanel').style.display='none';
 if(ws&&ws.readyState===1){
 ws.send(JSON.stringify({action:'select_project',project_id:pid}));
 }else{
@@ -1737,20 +2231,203 @@ body:JSON.stringify({project_id:pid})}).then(r=>r.json()).then(d=>{
 currentProjectId=d.selected||null;
 loadChatHistory();
 }).catch(()=>{})
-}}
+}
+loadProjects();
+}
 
 function createProjectModal(){
-const name=prompt('Project name:');
-if(!name)return;
-const desc=prompt('Description (optional):');
+document.getElementById('newProjectModal').style.display='flex';
+document.getElementById('newProjName').value='';
+document.getElementById('newProjDesc').value='';
+setTimeout(()=>document.getElementById('newProjName').focus(),100);
+}
+function closeNewProjectModal(){
+document.getElementById('newProjectModal').style.display='none';
+}
+function submitNewProject(){
+const name=document.getElementById('newProjName').value.trim();
+if(!name){alert('Project name required');return}
+const desc=document.getElementById('newProjDesc').value.trim();
+const btn=document.getElementById('newProjSubmit');
+btn.disabled=true;btn.textContent='Creating...';
 fetch('/api/projects/create',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({name:name,description:desc||''})}).then(r=>r.json()).then(d=>{
+body:JSON.stringify({name:name,description:desc})}).then(r=>r.json()).then(d=>{
+btn.disabled=false;btn.textContent='Create Project';
 if(d.error){alert('Error: '+d.error);return}
 currentProjectId=d.project_id;
+closeNewProjectModal();
 loadProjects();
 loadChatHistory();
-}).catch(e=>alert('Failed: '+e))}
+}).catch(e=>{btn.disabled=false;btn.textContent='Create Project';alert('Failed: '+e)})}
+// Allow Enter key in name field to submit
+document.addEventListener('DOMContentLoaded',()=>{
+const nf=document.getElementById('newProjName');
+if(nf)nf.addEventListener('keydown',(e)=>{if(e.key==='Enter')submitNewProject()});
+});
+
+// ─── M4: Project Execution ───
+
+const PHASE_NAMES=['Blueprint','Build Phase 1','Build Phase 2','Build Phase 3','Proto Deploy','Production'];
+const TDD_STEPS=['AC','RED','GREEN','BC','BF','SEA','DS','OA','VB','GIT','CL','CCP','AD'];
+let projectProgress={phase:0,step:'',tddSteps:{}};
+
+function launchProject(){
+if(!currentProjectId){appendChat('system','Select a project first.');return}
+const btn=document.getElementById('launchBtn');
+btn.disabled=true;btn.textContent='Launching...';
+if(ws&&ws.readyState===1){
+ws.send(JSON.stringify({action:'launch_project',project_id:currentProjectId}));
+btn.textContent='Running';btn.classList.add('running');
+showProgressPanel();
+}else{
+fetch('/api/projects/launch',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({project_id:currentProjectId})}).then(r=>r.json()).then(d=>{
+if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Launch';return}
+btn.textContent='Running';btn.classList.add('running');
+showProgressPanel();
+}).catch(e=>{alert('Launch failed: '+e);btn.disabled=false;btn.textContent='Launch'})
+}}
+
+function showProgressPanel(){
+document.getElementById('pnl-progress').style.display='';
+renderTimeline(0,'pending');
+renderTddBar(null);
+}
+
+function renderTimeline(currentPhase,phaseStatus){
+const el=document.getElementById('projectTimeline');
+el.innerHTML=PHASE_NAMES.map((name,i)=>{
+let dotCls='pending',statusTxt='pending';
+if(i<currentPhase){dotCls='completed';statusTxt='done'}
+else if(i===currentPhase){
+if(phaseStatus==='running'){dotCls='running';statusTxt='running'}
+else if(phaseStatus==='completed'){dotCls='completed';statusTxt='done'}
+else if(phaseStatus==='failed'){dotCls='failed';statusTxt='failed'}
+else if(phaseStatus==='awaiting'){dotCls='awaiting';statusTxt='awaiting approval'}
+else{dotCls='running';statusTxt='running'}
+}
+const activeCls=i===currentPhase?' active':'';
+return `<div class="phase-step${activeCls}"><span class="phase-dot ${dotCls}"></span><span class="phase-label">${name}</span><span class="phase-status">${statusTxt}</span></div>`
+}).join('')
+}
+
+function renderTddBar(activeStep){
+const el=document.getElementById('tddBar');
+el.innerHTML=TDD_STEPS.map(s=>{
+const st=projectProgress.tddSteps[s]||'pending';
+let cls='tdd-step';
+if(s===activeStep)cls+=' running';
+else if(st==='completed')cls+=' completed';
+else if(st==='failed')cls+=' failed';
+return `<span class="${cls}">${s}</span>`
+}).join('')
+}
+
+function loadProjectProgress(){
+if(!currentProjectId)return;
+fetch('/api/projects/'+encodeURIComponent(currentProjectId)+'/progress').then(r=>r.json()).then(d=>{
+if(d.error)return;
+const phase=d.current_phase||0;
+const status=d.status||'active';
+renderTimeline(phase,d.is_running?'running':status==='active'?'pending':'completed');
+// Update launch button
+const btn=document.getElementById('launchBtn');
+if(d.is_running){
+btn.textContent='Running';btn.classList.add('running');btn.disabled=true;
+document.getElementById('pnl-progress').style.display='';
+}
+// Show UAT panel if at phase 4
+if(phase>=4&&status==='active'){
+document.getElementById('uatPanel').style.display='';
+}
+}).catch(()=>{})}
+
+function showBlueprintModal(){
+if(!currentProjectId)return;
+document.getElementById('blueprintModal').style.display='flex';
+document.getElementById('blueprintBody').innerHTML='<span style="color:var(--dim)">Loading...</span>';
+fetch('/api/projects/'+encodeURIComponent(currentProjectId)+'/blueprint').then(r=>r.json()).then(d=>{
+let html='';
+if(d.blueprint&&d.blueprint.content){
+html+='<div class="ct">'+renderMd(d.blueprint.content)+'</div>';
+if(d.blueprint.approved_by){
+html+='<div style="margin-top:12px;color:var(--green);font-size:11px">Approved by: '+escHtml(d.blueprint.approved_by)+' at '+escHtml(d.blueprint.approved_at||'')+'</div>';
+}
+}else{
+html='<span style="color:var(--dim)">No blueprint generated yet.</span>';
+}
+if(d.contracts&&Object.keys(d.contracts).length){
+Object.entries(d.contracts).forEach(([fname,content])=>{
+html+=`<div class="contract-section"><h3>${escHtml(fname)}</h3><pre>${escHtml(content)}</pre></div>`;
+});
+}
+document.getElementById('blueprintBody').innerHTML=html;
+}).catch(e=>{document.getElementById('blueprintBody').innerHTML='Error: '+escHtml(String(e))})}
+
+function closeBlueprintModal(){document.getElementById('blueprintModal').style.display='none'}
+
+function approveBlueprint(){
+if(!currentProjectId)return;
+if(!confirm('Approve blueprint and lock contracts? This cannot be undone for this phase.'))return;
+if(ws&&ws.readyState===1){
+ws.send(JSON.stringify({action:'approve_blueprint',project_id:currentProjectId}));
+}else{
+fetch('/api/projects/'+encodeURIComponent(currentProjectId)+'/approve-blueprint',{method:'POST',
+headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json()).then(d=>{
+if(d.error)alert(d.error);
+}).catch(e=>alert('Failed: '+e))
+}
+closeBlueprintModal();
+}
+
+function approveUAT(){
+if(!currentProjectId)return;
+if(!confirm('Approve UAT and deploy to production? This will merge to main and tag v1.0.0.'))return;
+if(ws&&ws.readyState===1){
+ws.send(JSON.stringify({action:'approve_uat',project_id:currentProjectId}));
+}else{
+fetch('/api/projects/'+encodeURIComponent(currentProjectId)+'/approve-uat',{method:'POST',
+headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json()).then(d=>{
+if(d.error)alert(d.error);
+}).catch(e=>alert('Failed: '+e))
+}
+document.getElementById('uatPanel').style.display='none';
+}
 
 conn();setInterval(()=>{if(!ws||ws.readyState!==1){fetch('/api/status').then(r=>r.json()).then(upd).catch(()=>{})}},5000);
 </script>
+
+<!-- New Project Modal -->
+<div class="modal-overlay" id="newProjectModal" style="display:none" onclick="if(event.target===this)closeNewProjectModal()">
+<div class="modal-box" style="max-width:480px">
+<h2>New Project</h2>
+<div class="modal-body" style="padding:16px 0">
+<div style="margin-bottom:12px">
+<label style="font-size:11px;color:var(--dim);display:block;margin-bottom:4px">PROJECT NAME <span style="color:var(--red)">*</span></label>
+<input id="newProjName" type="text" placeholder="e.g. Personal Library Manager" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:4px;font-family:inherit;font-size:13px">
+</div>
+<div>
+<label style="font-size:11px;color:var(--dim);display:block;margin-bottom:4px">DESCRIPTION</label>
+<textarea id="newProjDesc" rows="3" placeholder="What should this project do?" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:4px;font-family:inherit;font-size:13px;resize:vertical"></textarea>
+</div>
+</div>
+<div class="modal-actions">
+<button id="newProjSubmit" class="btn ap" onclick="submitNewProject()" style="padding:8px 20px;font-size:12px">Create Project</button>
+<button class="btn" onclick="closeNewProjectModal()" style="padding:8px 20px;font-size:12px">Cancel</button>
+</div>
+</div>
+</div>
+
+<!-- M4: Blueprint Approval Modal -->
+<div class="modal-overlay" id="blueprintModal" style="display:none" onclick="if(event.target===this)closeBlueprintModal()">
+<div class="modal-box">
+<h2>Blueprint Approval</h2>
+<div class="modal-body" id="blueprintBody">Loading...</div>
+<div class="modal-actions">
+<button class="btn ap" onclick="approveBlueprint()" style="padding:8px 20px;font-size:12px">Approve &amp; Lock Contracts</button>
+<button class="btn" onclick="closeBlueprintModal()" style="padding:8px 20px;font-size:12px">Close</button>
+</div>
+</div>
+</div>
+
 </body></html>"""

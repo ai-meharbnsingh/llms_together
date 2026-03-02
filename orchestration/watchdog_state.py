@@ -86,7 +86,7 @@ class WatchdogStatePersistence:
         try:
             self.heartbeat_file.write_text(str(time.time()))
         except Exception:
-            pass
+            logger.debug("Heartbeat file write failed", exc_info=True)
 
     # ========================================
     # LOAD: Called on restart after crash
@@ -136,6 +136,7 @@ class WatchdogStatePersistence:
             age = time.time() - ts
             return age < max_age_seconds
         except Exception:
+            logger.debug("Heartbeat read failed", exc_info=True)
             return False
 
     def get_last_heartbeat_age(self) -> float:
@@ -146,6 +147,7 @@ class WatchdogStatePersistence:
             ts = float(self.heartbeat_file.read_text().strip())
             return time.time() - ts
         except Exception:
+            logger.debug("Heartbeat age read failed", exc_info=True)
             return float("inf")
 
     # ========================================

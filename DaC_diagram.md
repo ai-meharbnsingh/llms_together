@@ -267,10 +267,17 @@ flowchart TD
     NEXT_TASK -->|Yes| TASK_LOOP
     NEXT_TASK -->|No| E2E[Run E2E Tests\nPlaywright Full Walkthrough]
 
-    E2E --> SCREENSHOTS[Capture Screenshots\nscreenshots/wave-N/]
+    E2E --> E2E_RESULT{E2E Passed?}
+    E2E_RESULT -->|No| UAT_BLOCKED["awaiting: uat_blocked_e2e\nlogger.warning — UAT locked"]
+    E2E_RESULT -->|Yes| SCREENSHOTS[Capture Screenshots\nscreenshots/wave-N/]
+
+    UAT_BLOCKED --> FIX_E2E[Fix failing tests\nnew wave required]
+    FIX_E2E --> E2E
+
     SCREENSHOTS --> REVIEW{User Review}
     REVIEW -->|Changes needed| NEXT_WAVE[New Wave / Phase]
-    REVIEW -->|Approved| VISUAL_BASE[Visual Baseline\nfor VMSA]
+    REVIEW -->|Approved| UAT_APPROVAL["awaiting: uat_approval\napprove_uat() unblocked"]
+    UAT_APPROVAL --> VISUAL_BASE[Visual Baseline\nfor VMSA]
     VISUAL_BASE --> DONE([Phase Complete])
 ```
 
@@ -292,12 +299,17 @@ sequenceDiagram
 
     loop Every 5 seconds
         WD->>Q: dequeue all pending writes
+        note over WD: drain_write_queue() — async
+        WD->>WD: asyncio.to_thread(_drain_batch_sync, writes)
+        note over WD: ← sync SQLite work runs in thread pool
         WD->>DB: BEGIN TRANSACTION
         loop Each write request
             WD->>DB: _execute_write(conn, write)
             DB-->>WD: result
         end
         WD->>DB: COMMIT
+        WD-->>WD: thread returns (results list)
+        note over WD: back in async context — thread-safe Future resolution
         WD->>BUS: resolve(callback_id, result)
     end
 

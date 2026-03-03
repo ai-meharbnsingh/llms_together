@@ -34,6 +34,8 @@ try:
     from orchestration.dac_tagger import DaCTagger
     from orchestration.learning_log import LearningLog
     from orchestration.cicd_generator import CICDGenerator
+    from orchestration.orchestrator_brain import OrchestratorBrain
+    from orchestration.workspace_manager import WorkspaceManager
 except ImportError as _exc:
     logging.getLogger("factory.orchestrator").warning(
         f"Optional execution-engine imports unavailable: {_exc}"
@@ -100,6 +102,12 @@ class MasterOrchestrator:
         # Document of Context — loaded from DB on recovery
         self._doc_context = None
         self._load_doc_context()
+
+        # LLM-powered intelligence layer (never blocks pipeline — falls back to heuristics)
+        try:
+            self.brain = OrchestratorBrain(self.router, self.db)
+        except Exception:
+            self.brain = None
 
     def _get_worker(self, role: str) -> Optional[WorkerAdapter]:
         """Get worker for role via router. Logs if unavailable."""
@@ -1154,12 +1162,67 @@ class MasterOrchestrator:
         }
 
     async def handle_escalation(self, esc_id: int, decision: str):
+        # Fetch escalation details before resolving
+        escalation = None
+        try:
+            pending = self.db.get_pending_escalations(limit=50)
+            escalation = next(
+                (e for e in pending if e.get("escalation_id") == esc_id), None
+            )
+        except Exception:
+            pass
+
         self.db.request_write("update", "escalations", {
             "_where": {"escalation_id": esc_id},
             "human_decision": decision, "status": "resolved",
             "resolved_at": datetime.now().isoformat(),
         })
-        return {"resolved": True}
+
+        # Brain interprets the human decision and routes accordingly
+        brain_result = None
+        if self.brain and escalation:
+            try:
+                task_context = None
+                task_id = escalation.get("task_id")
+                if task_id:
+                    tasks = self.db.get_tasks_by_status(None)
+                    task_context = next(
+                        (t for t in tasks if t.get("task_id") == task_id), None
+                    )
+                brain_result = await self.brain.interpret_resolution(
+                    escalation, decision, task_context
+                )
+                logger.info(
+                    f"Brain interpreted escalation {esc_id}: "
+                    f"action={brain_result.get('action')}, "
+                    f"learning={brain_result.get('learning', '')[:80]}"
+                )
+
+                # Log learning to the learning log
+                learning_text = brain_result.get("learning", "")
+                if learning_text:
+                    try:
+                        from orchestration.learning_log import LearningLog
+                        ll = LearningLog(self.db)
+                        ll.log_fix(
+                            bug_description=f"[ESCALATION] {escalation.get('escalation_reason', '')[:200]}",
+                            root_cause=f"Human decision: {decision[:150]}",
+                            fix_applied=learning_text[:300],
+                            fixed_by="human_escalation",
+                            prevention_strategy=brain_result.get("prompt_modifier", "")[:300],
+                            keywords=["escalation", "human_decision",
+                                      escalation.get("escalation_type", "")],
+                            task_id=task_id,
+                        )
+                    except Exception as le:
+                        logger.debug(f"Learning log write after escalation failed (non-fatal): {le}")
+            except Exception as be:
+                logger.debug(f"Brain interpret_resolution failed (non-fatal): {be}")
+
+        return {
+            "resolved": True,
+            "brain_action": brain_result.get("action") if brain_result else None,
+        }
 
     # ─── Prompt builders ───
 
@@ -1242,14 +1305,40 @@ class MasterOrchestrator:
                 return {"success": False, "phases_completed": 0,
                         "errors": ["Git repository initialization failed"],
                         "project_path": project_path}
+
+            # Init worktree isolation (if enabled in config)
+            workspace_mgr = None
+            ws_config = self.config.get("workspaces", {})
+            if ws_config.get("enabled", False):
+                project_type = project.get("project_type", "web")
+                try:
+                    workspace_mgr = WorkspaceManager(project_path, project_type)
+                    worktrees = workspace_mgr.setup_worktrees()
+                    if worktrees:
+                        logger.info(
+                            f"Worktree isolation active: {list(worktrees.keys())}"
+                        )
+                    else:
+                        workspace_mgr = None
+                except Exception as _ws_err:
+                    logger.warning(
+                        f"Worktree setup failed — falling back to single-path: {_ws_err}"
+                    )
+                    workspace_mgr = None
+
             phases_completed = 0
 
             # ─── Generate tasks from blueprint ───────────────────────────────
-            # Parse blueprint into concrete task rows in DB so _phase_build()
-            # finds real work to execute instead of skipping with "No tasks".
-            tasks_count = await self._generate_tasks_from_blueprint(
-                project, blueprint_result.get("blueprint", "")
-            )
+            # Skip generation if tasks already exist (re-entry after compile failure).
+            # This prevents duplicate task IDs and runaway LLM task generation.
+            _existing_p1 = self.db.get_tasks_by_phase(project_id, 1)
+            if _existing_p1:
+                tasks_count = len(_existing_p1)
+                logger.info(f"Tasks already exist for {project_id} — skipping generation ({tasks_count} phase-1 tasks)")
+            else:
+                tasks_count = await self._generate_tasks_from_blueprint(
+                    project, blueprint_result.get("blueprint", "")
+                )
             if on_progress:
                 await on_progress(0, "task_gen", "running",
                                   f"Generated {tasks_count} tasks across 3 phases")
@@ -1257,6 +1346,7 @@ class MasterOrchestrator:
 
             # ─── Phases 1-3: Build ───
             total_phases = blueprint_result.get("total_phases", 3)
+            prior_phase_files: list = []
             for phase_num in range(1, total_phases + 1):
                 if on_progress:
                     await on_progress(phase_num, "planning", "running",
@@ -1265,10 +1355,15 @@ class MasterOrchestrator:
                 phase_result = await self._phase_build(
                     project, project_path, phase_num,
                     context_mgr, rules_engine, dac_tagger,
-                    learning_log, git_mgr, on_progress
+                    learning_log, git_mgr, on_progress,
+                    prior_phase_files=prior_phase_files,
+                    workspace_mgr=workspace_mgr,
                 )
 
                 errors.extend(phase_result.get("errors", []))
+
+                # Accumulate written files for next phase's context
+                prior_phase_files = phase_result.get("all_written_files", prior_phase_files)
 
                 # Only hard-stop if the phase produced ZERO completed tasks
                 # (i.e. nothing was built at all). Partial failures are expected
@@ -1277,10 +1372,27 @@ class MasterOrchestrator:
                     logger.error(f"Phase {phase_num}: all tasks failed — stopping build")
                     break
 
+                # Post-phase compilation gate: block next phase if code is broken
+                compile_result = await self._check_compilation(project_path, phase_num, on_progress)
+                if not compile_result["passed"]:
+                    logger.error(f"Phase {phase_num} compile failed — blocking phase {phase_num + 1}")
+                    errors.extend(compile_result["errors"])
+                    phases_completed = phase_num  # count partial phase so UAT is reached
+                    break
+
                 phases_completed = phase_num
 
+            # Cleanup worktrees before moving to Phase 4 (all parallel work done)
+            if workspace_mgr and workspace_mgr.is_active():
+                try:
+                    workspace_mgr.cleanup_worktrees()
+                    logger.info("Worktree cleanup complete — all domains merged to develop")
+                except Exception as _wc_err:
+                    logger.warning(f"Worktree cleanup error (non-fatal): {_wc_err}")
+
             # ─── Phase 4: Proto + CI/CD + E2E ───
-            if phases_completed >= total_phases:
+            # Always reach UAT if at least 1 phase ran (compile failures are reported in UAT)
+            if phases_completed >= 1:
                 if on_progress:
                     await on_progress(4, "proto", "running", "Proto deployment")
 
@@ -1306,6 +1418,15 @@ class MasterOrchestrator:
 
                 # M: Auto-run E2E tests on generated project
                 e2e_result = await self._run_e2e_tests(project_path, on_progress)
+
+                # Log phase 4 (E2E) completion
+                self.db.request_write("insert", "phase_completions", {
+                    "project_id": project_id,
+                    "phase": 4,
+                    "e2e_tests_passed": e2e_result.get("success", False),
+                    "test_results": json.dumps(e2e_result),
+                    "human_uat_completed": False,
+                })
 
                 # Update project status
                 self.db.request_write("update", "projects", {
@@ -1356,8 +1477,17 @@ class MasterOrchestrator:
         project_id = project["project_id"]
         project_type = project.get("project_type", "web")
 
-        # 0. Check if blueprint already approved — skip generation if so
-        existing = self.db.get_latest_blueprint(project_id)
+        # 0. Check if blueprint already approved — skip generation if so.
+        # Retry up to 6s: the fire-and-forget DB write from approve_blueprint()
+        # may not have been drained by the Watchdog yet when execute_project()
+        # is re-launched immediately after approval.
+        existing = None
+        for _attempt in range(7):
+            existing = self.db.get_latest_blueprint(project_id)
+            if existing and existing.get("approved_by"):
+                break
+            if _attempt < 6:
+                await asyncio.sleep(1)
         if existing and existing.get("approved_by"):
             logger.info(f"Blueprint already approved for {project_id} — skipping generation")
             return {
@@ -1619,11 +1749,20 @@ class MasterOrchestrator:
         dac_tagger: "DaCTagger", git_mgr: "GitManager",
         on_progress: Callable = None,
         learning_log: "LearningLog" = None,
+        phase_written_files: list = None,
+        workspace_mgr=None,
+        task_domain: str = None,
     ) -> dict:
         """Execute one task through the full 13-step pipeline.
 
+        Args:
+            phase_written_files: Absolute paths to files written by tasks that
+                completed before this one in the current phase.  Passed through
+                to build_task_prompt() so the worker sees existing code and
+                avoids broken cross-file references / duplicate definitions.
+
         Returns {"success": bool, "task_id": str, "files": int,
-                 "tdd": bool, "gate": str, "error": str}
+                 "file_paths": list[str], "tdd": bool, "gate": str, "error": str}
         """
         task_id = task["task_id"]
         project_id = project["project_id"]
@@ -1669,9 +1808,11 @@ class MasterOrchestrator:
             }
 
         # 1. Git pull latest (async — serialised via _commit_lock, FER-AF-038)
-        _pull_result = git_mgr.pull_latest()
-        if hasattr(_pull_result, "__await__") or asyncio.iscoroutine(_pull_result):
-            await _pull_result
+        # Skip if worktree active — sync_from_develop already done in _guarded
+        if not (workspace_mgr and workspace_mgr.is_active() and task_domain):
+            _pull_result = git_mgr.pull_latest()
+            if hasattr(_pull_result, "__await__") or asyncio.iscoroutine(_pull_result):
+                await _pull_result
 
         # 2. Kimi classifies complexity
         complexity = await self._classify_task(task)
@@ -1691,8 +1832,12 @@ class MasterOrchestrator:
                     "tdd": False, "gate": None,
                     "error": f"No worker for role {role}"}
 
-        # 4. Build task prompt
-        prompt = context_mgr.build_task_prompt(task, project, project_path)
+        # 4. Build task prompt — include files written by earlier phase tasks so
+        # the worker can use correct imports/types instead of inventing its own.
+        prompt = context_mgr.build_task_prompt(
+            task, project, project_path,
+            phase_written_files=phase_written_files or [],
+        )
 
         # FER-AF-003 FIX: Inject past learnings so workers benefit from prior
         # failures.  Only non-empty results are appended to avoid prompt bloat.
@@ -1726,20 +1871,47 @@ class MasterOrchestrator:
             logger.warning(f"Cost tracking write failed (non-fatal): {_ce}")
 
         if not worker_result.get("success"):
-            dac_tagger.tag(task_id, "worker_crash",
-                           f"Worker {role} failed on task",
-                           source_worker=self._get_worker_name(role),
-                           project_id=project_id)
-            return {"success": False, "task_id": task_id, "files": 0,
-                    "tdd": False, "gate": None, "error": "Worker failed"}
+            # Brain-guided worker switch: consult brain before giving up
+            switched = False
+            if self.brain:
+                try:
+                    worker_advice = await self.brain.suggest_worker(
+                        task, self._get_worker_name(role),
+                        failure_history=[{"worker": self._get_worker_name(role),
+                                          "error": worker_result.get("error", "Worker call failed")}],
+                    )
+                    alt_name = worker_advice.get("worker")
+                    alt_worker = self.router.workers.get(alt_name) if alt_name else None
+                    if alt_worker and alt_name != self._get_worker_name(role):
+                        logger.info(
+                            f"Brain switching from {self._get_worker_name(role)} to "
+                            f"{alt_name} for {task_id}: {worker_advice.get('reason', '')[:80]}"
+                        )
+                        worker_result = await alt_worker.send_message(
+                            prompt, system_prompt=f"Execute task {task_id}"
+                        )
+                        if worker_result.get("success"):
+                            switched = True
+                            worker = alt_worker
+                except Exception as be:
+                    logger.debug(f"Brain suggest_worker failed (non-fatal): {be}")
+
+            if not switched and not worker_result.get("success"):
+                dac_tagger.tag(task_id, "worker_crash",
+                               f"Worker {role} failed on task",
+                               source_worker=self._get_worker_name(role),
+                               project_id=project_id)
+                return {"success": False, "task_id": task_id, "files": 0,
+                        "tdd": False, "gate": None, "error": "Worker failed"}
 
         # 6. Parse structured output
-        parser = OutputParser(project_path)
+        parser = OutputParser(project_path, dac_tagger=dac_tagger)
         task_module = task.get("module")
         summary, violations = parser.parse_and_apply(
             worker_result["response"], task_id,
             worker_name=self._get_worker_name(role),
             task_module=task_module,
+            project_id=project_id,
         )
         if violations:
             logger.warning(f"Task {task_id}: retrying due to violations")
@@ -1773,6 +1945,7 @@ class MasterOrchestrator:
                     retry["response"], task_id,
                     worker_name=self._get_worker_name(role),
                     task_module=task_module,
+                    project_id=project_id,
                 )
 
         # --- FER-AF-012: Abort task if TRAP violations persist after retry ---
@@ -1854,18 +2027,86 @@ class MasterOrchestrator:
         # 10. DaC tagging from TDD
         dac_tagger.tag_from_tdd_result(task_id, tdd_result, project_id)
 
-        # 11. Kimi quality gate (with retry loop)
+        # 11. Kimi quality gate (with brain-guided retry loop)
         gate_result = await self._quality_gate(
             task, parsed_output, project_path, validator
         )
         rejection_count = 0
+        past_gate_results = []
+        retry_worker = worker  # may change if brain suggests worker switch
         while gate_result.get("verdict") == "REJECTED" and rejection_count < 2:
             rejection_count += 1
+            past_gate_results.append(gate_result)
+            # Log each intermediate gate rejection to quality_gates table
+            self.db.request_write("insert", "quality_gates", {
+                "task_id": task_id,
+                "gate_type": "kimi_review",
+                "passed": False,
+                "confidence_score": gate_result.get("confidence", 0.5),
+                "findings": json.dumps(gate_result.get("issues", [])),
+                "executed_by": gate_result.get("by", "unknown"),
+            })
             dac_tagger.tag_gate_rejection(
                 task_id, rejection_count, gate_result, project_id
             )
-            retry = await worker.send_message(
-                prompt + f"\n\nPREVIOUS ATTEMPT REJECTED: {gate_result.get('issues', [])}",
+
+            # Brain-guided retry: analyze rejection and decide strategy
+            brain_advice = None
+            if self.brain:
+                try:
+                    brain_advice = await self.brain.analyze_rejection(
+                        task, gate_result, rejection_count,
+                        past_attempts=past_gate_results[:-1],
+                    )
+                    logger.info(
+                        f"Brain analysis for {task_id} (attempt {rejection_count}): "
+                        f"strategy={brain_advice.get('strategy')}, "
+                        f"diagnosis={brain_advice.get('diagnosis', '')[:100]}"
+                    )
+                except Exception as be:
+                    logger.debug(f"Brain analyze_rejection failed (non-fatal): {be}")
+
+            strategy = (brain_advice or {}).get("strategy", "targeted_retry")
+
+            if strategy == "escalate_to_human":
+                # Brain says this needs human attention — break out early
+                logger.info(f"Brain recommends escalation for {task_id}")
+                break
+
+            if strategy == "switch_worker":
+                # Brain suggests trying a different worker
+                worker_advice = None
+                if self.brain:
+                    try:
+                        worker_advice = await self.brain.suggest_worker(
+                            task, self._get_worker_name(role),
+                            failure_history=[{"worker": self._get_worker_name(role),
+                                              "error": gate_result.get("issues", [])}],
+                        )
+                    except Exception:
+                        pass
+                alt_name = (worker_advice or {}).get("worker")
+                alt_worker = self.router.workers.get(alt_name) if alt_name else None
+                if alt_worker:
+                    retry_worker = alt_worker
+                    logger.info(f"Brain switching worker to '{alt_name}' for {task_id}")
+
+            # Build retry prompt with brain guidance
+            guidance = (brain_advice or {}).get("retry_guidance", "")
+            if guidance:
+                retry_prompt = (
+                    f"{prompt}\n\n"
+                    f"PREVIOUS ATTEMPT REJECTED (attempt #{rejection_count}):\n"
+                    f"Issues: {gate_result.get('issues', [])}\n\n"
+                    f"BRAIN GUIDANCE: {guidance}"
+                )
+            else:
+                retry_prompt = (
+                    prompt + f"\n\nPREVIOUS ATTEMPT REJECTED: {gate_result.get('issues', [])}"
+                )
+
+            retry = await retry_worker.send_message(
+                retry_prompt,
                 system_prompt=f"Retry task {task_id} — address gate feedback"
             )
             if retry.get("success"):
@@ -1873,28 +2114,132 @@ class MasterOrchestrator:
                     retry["response"], task_id,
                     worker_name=self._get_worker_name(role),
                     task_module=task_module,
+                    project_id=project_id,
                 )
                 gate_result = await self._quality_gate(
                     task, parsed_output, project_path, validator
                 )
 
         succeeded = gate_result.get("verdict") != "REJECTED"
+        # Log the final gate verdict
+        self.db.request_write("insert", "quality_gates", {
+            "task_id": task_id,
+            "gate_type": "kimi_review",
+            "passed": succeeded,
+            "confidence_score": gate_result.get("confidence", 0.5),
+            "findings": json.dumps(gate_result.get("issues", [])),
+            "executed_by": gate_result.get("by", "unknown"),
+        })
         if succeeded:
             self.db.request_write("update", "tasks", {
                 "_where": {"task_id": task_id},
                 "status": "approved", "current_step": "AD",
             })
+            # Resolve any open DaC tags for this task — the task passed the gate,
+            # so pending TRAP/SER/etc. tags should be marked resolved (not left open).
+            # First, capture resolution context in the learning log (positive signal).
+            try:
+                open_tags = self.db.get_dac_tags(task_id=task_id, status="open")
+                if open_tags:
+                    from orchestration.learning_log import LearningLog
+                    ll = LearningLog(self.db)
+                    for otag in open_tags:
+                        ll.log_fix(
+                            bug_description=f"[RESOLVED] [{otag.get('tag_type', '?')}] {otag.get('context', '')[:200]}",
+                            root_cause=f"[{otag.get('tag_type', '?')}] {otag.get('context', '')[:150]}",
+                            fix_applied=f"Task {task_id} passed quality gate after retry — issue self-corrected",
+                            fixed_by="auto_resolution",
+                            prevention_strategy=f"Worker recovered from {otag.get('tag_type', '?')} on retry — pattern may be transient",
+                            keywords=[otag.get("tag_type", ""), "resolved", task_id[:8] if task_id else ""],
+                            project_id=project_id,
+                            task_id=task_id,
+                        )
+            except Exception as e:
+                logger.debug(f"Resolution learning log write failed (non-fatal): {e}")
+            self.db.request_write("update", "dac_tags", {
+                "_where": {"task_id": task_id, "status": "open"},
+                "status": "resolved",
+            })
         else:
+            # Brain-powered escalation: compose rich failure analysis
+            past_gate_results.append(gate_result)
+            escalation_data = None
+            if self.brain:
+                try:
+                    dac_tags = self.db.get_dac_tags(task_id=task_id, status="open")
+                    escalation_data = await self.brain.compose_escalation(
+                        task, past_gate_results, dac_tags
+                    )
+                    logger.info(
+                        f"Brain escalation for {task_id}: "
+                        f"{escalation_data.get('summary', '')[:100]}"
+                    )
+                except Exception as be:
+                    logger.debug(f"Brain compose_escalation failed (non-fatal): {be}")
+
             dac_tagger.tag(task_id, "double_rejection",
                            f"Task rejected {rejection_count + 1}x by gatekeeper",
                            project_id=project_id)
+
+            # Create enriched escalation with brain analysis
+            esc_context = {
+                "rejection_count": rejection_count + 1,
+                "gate_issues": [gr.get("issues", []) for gr in past_gate_results],
+            }
+            if escalation_data:
+                esc_context["brain_analysis"] = escalation_data.get("summary", "")
+                esc_context["root_cause"] = escalation_data.get("root_cause", "")
+                esc_context["options"] = escalation_data.get("options", [])
+            self.db.request_write("insert", "escalations", {
+                "task_id": task_id,
+                "escalation_type": "task_failure",
+                "escalated_by": "orchestrator_brain",
+                "escalation_reason": (
+                    escalation_data.get("summary", "") if escalation_data
+                    else f"Task rejected {rejection_count + 1}x by quality gate"
+                ),
+                "context_data": json.dumps(esc_context),
+                "status": "pending",
+            })
             self.db.request_write("update", "tasks", {
                 "_where": {"task_id": task_id},
                 "status": "failed", "current_step": "AD",
             })
 
-        # 12. Git commit (async — serialised via _commit_lock to prevent index.lock races)
-        await git_mgr.atomic_commit(task_id, f"Complete: {task['description'][:50]}")
+        # 12. Git commit — worktree-aware or legacy fallback
+        if workspace_mgr and workspace_mgr.is_active() and task_domain:
+            # Commit in domain worktree
+            await workspace_mgr.commit_in_worktree(
+                task_domain, task_id,
+                f"Complete: {task['description'][:50]}"
+            )
+            # Auto-merge to develop if task was approved
+            if succeeded:
+                merge_ok = await workspace_mgr.merge_to_develop(task_domain, task_id)
+                if not merge_ok:
+                    dac_tagger.tag(
+                        task_id, "SER",
+                        f"Merge conflict: {task_domain} → develop after task {task_id}",
+                        source_step="worktree_merge",
+                        project_id=project_id,
+                    )
+                    self.db.request_write("insert", "escalations", {
+                        "task_id": task_id,
+                        "escalation_type": "merge_conflict",
+                        "escalated_by": "workspace_manager",
+                        "escalation_reason": (
+                            f"Merge conflict merging {task_domain} → develop "
+                            f"after task {task_id} approval"
+                        ),
+                        "context_data": json.dumps({
+                            "domain": task_domain,
+                            "task_id": task_id,
+                        }),
+                        "status": "pending",
+                    })
+        else:
+            # Legacy single-path commit (serialised via _commit_lock)
+            await git_mgr.atomic_commit(task_id, f"Complete: {task['description'][:50]}")
 
         # Phi3 summary
         if self.phi3:
@@ -1906,10 +2251,18 @@ class MasterOrchestrator:
                 self.session_id, persist_full=True
             )
 
+        written = summary.get("files_written", [])
         return {
             "success": succeeded,
             "task_id": task_id,
-            "files": len(summary.get("files_written", [])),
+            "files": len(written),
+            # Absolute paths so _phase_build can pass them directly to
+            # subsequent tasks as phase_written_files.
+            "file_paths": [
+                str(Path(project_path) / f["path"])
+                for f in written
+                if f.get("action") != "deleted"
+            ],
             "tdd": tdd_result.get("success"),
             "gate": gate_result.get("verdict"),
             "error": "" if succeeded else "Gate rejected",
@@ -1919,7 +2272,9 @@ class MasterOrchestrator:
                             phase_num: int, context_mgr: "ContextManager",
                             rules_engine: "RulesEngine", dac_tagger: "DaCTagger",
                             learning_log: "LearningLog", git_mgr: "GitManager",
-                            on_progress: Callable = None) -> dict:
+                            on_progress: Callable = None,
+                            prior_phase_files: list = None,
+                            workspace_mgr=None) -> dict:
         """Execute a single build phase (1-3) with dependency-aware parallel tasks."""
         project_id = project["project_id"]
 
@@ -1954,6 +2309,9 @@ class MasterOrchestrator:
         completed_task_ids: set = set()
         failed_tasks: list = []
         task_results: dict = {}
+        # Seed with files from prior phases so workers in this phase can see
+        # what was written by earlier phases and use correct imports / types.
+        phase_written_files: list = list(prior_phase_files or [])
         pending = {t["task_id"]: t for t in tasks}
 
         while pending:
@@ -1963,25 +2321,73 @@ class MasterOrchestrator:
                 if all(dep in completed_task_ids for dep in dep_graph.get(tid, []))
             ]
             if not ready:
-                # Deadlock: run the first pending task to unblock
+                # Deadlock: use brain to pick the best task to unblock
                 logger.warning(
                     f"Phase {phase_num}: dependency deadlock among "
-                    f"{list(pending.keys())} — running first task to unblock"
+                    f"{list(pending.keys())} — consulting brain"
                 )
-                ready = [next(iter(pending.values()))]
+                chosen_task = None
+                if self.brain:
+                    try:
+                        dl_result = await self.brain.resolve_deadlock(
+                            pending, dep_graph, completed_task_ids,
+                        )
+                        chosen_id = dl_result.get("task_to_run")
+                        if chosen_id and chosen_id in pending:
+                            chosen_task = pending[chosen_id]
+                            logger.info(
+                                f"Brain deadlock resolution: run {chosen_id} — "
+                                f"{dl_result.get('reason', '')[:80]}"
+                            )
+                    except Exception as be:
+                        logger.debug(f"Brain resolve_deadlock failed (non-fatal): {be}")
+                if not chosen_task:
+                    chosen_task = next(iter(pending.values()))
+                ready = [chosen_task]
 
             logger.info(
                 f"Phase {phase_num}: wave — running {len(ready)} task(s) in parallel: "
                 f"{[t['task_id'] for t in ready]}"
             )
 
+            # Snapshot current written files for this wave — tasks running in
+            # the same wave do NOT see each other's output (race condition), but
+            # they all see every file from prior waves.
+            files_snapshot = list(phase_written_files)
+
             # Execute this wave concurrently — semaphore limits concurrency (FER-AF-036)
-            async def _guarded(task):
+            async def _guarded(task, _files=files_snapshot):
+                # Resolve worktree for domain isolation (if active)
+                effective_path = project_path
+                task_domain = None
+                if workspace_mgr and workspace_mgr.is_active():
+                    task_domain, effective_path = workspace_mgr.resolve_worktree(task)
+                    sync_ok = await workspace_mgr.sync_from_develop(task_domain)
+                    if not sync_ok:
+                        dac_tagger.tag(
+                            task["task_id"], "SER",
+                            f"Worktree sync failed for domain {task_domain} — "
+                            f"merge conflict from develop",
+                            source_step="worktree_sync",
+                            project_id=project["project_id"],
+                        )
+                        return {
+                            "success": False,
+                            "task_id": task["task_id"],
+                            "files": 0,
+                            "tdd": False,
+                            "gate": None,
+                            "error": f"Worktree sync conflict in {task_domain}",
+                        }
+
                 async with self._task_semaphore:
                     return await self._execute_single_task(
-                        task, project, project_path,
+                        task, project, effective_path,
                         context_mgr, rules_engine, dac_tagger, git_mgr, on_progress,
                         learning_log=learning_log,
+                        phase_written_files=_files,
+                        workspace_mgr=workspace_mgr,
+                        task_domain=task_domain,
                     )
 
             wave_results = await asyncio.gather(
@@ -1999,6 +2405,8 @@ class MasterOrchestrator:
                 elif result.get("success"):
                     completed_task_ids.add(tid)
                     task_results[tid] = result
+                    # Accumulate written files for the next wave's context
+                    phase_written_files.extend(result.get("file_paths", []))
                 else:
                     failed_tasks.append({
                         "task_id": tid,
@@ -2045,6 +2453,16 @@ class MasterOrchestrator:
             "current_phase": phase_num,
             "_where": {"project_id": project["project_id"]},
         })
+        # Log phase completion
+        self.db.request_write("insert", "phase_completions", {
+            "project_id": project["project_id"],
+            "phase": phase_num,
+            "e2e_tests_passed": False,
+            "test_results": json.dumps({
+                "tasks_completed": len(completed_task_ids),
+                "tasks_failed": len(failed_tasks),
+            }),
+        })
 
         return {
             "success": len(failed_tasks) == 0,
@@ -2052,7 +2470,60 @@ class MasterOrchestrator:
             "tasks_failed": len(failed_tasks),
             "task_results": task_results,
             "errors": [f["error"] for f in failed_tasks],
+            "all_written_files": phase_written_files,
         }
+
+    async def _check_compilation(self, project_path: str, phase_num: int,
+                                  on_progress=None) -> dict:
+        """Run py_compile on all .py files + tsc --noEmit if tsconfig.json exists.
+        Returns {"passed": bool, "errors": [str]}. Hard gate: failure blocks next phase."""
+        import subprocess as _sp
+        from pathlib import Path as _Path
+        project = _Path(project_path)
+        errors = []
+        excluded = {"venv", "__pycache__", "node_modules", ".git", "dist", "build"}
+
+        import sys as _sys
+        _python = _sys.executable or "python3"
+
+        for py_file in project.rglob("*.py"):
+            if any(p in excluded for p in py_file.parts):
+                continue
+            try:
+                proc = await asyncio.to_thread(
+                    _sp.run, [_python, "-m", "py_compile", str(py_file)],
+                    capture_output=True, text=True, timeout=15)
+                if proc.returncode != 0:
+                    errors.append(f"[PY] {py_file.relative_to(project)}: {proc.stderr.strip()}")
+            except Exception as e:
+                logger.warning(f"py_compile error for {py_file}: {e}")
+
+        tsconfig = project / "tsconfig.json"
+        if tsconfig.exists():
+            try:
+                proc = await asyncio.to_thread(
+                    _sp.run, ["npx", "tsc", "--noEmit", "--project", str(tsconfig)],
+                    capture_output=True, text=True, timeout=60, cwd=str(project))
+                if proc.returncode != 0:
+                    for line in (proc.stdout + proc.stderr).splitlines()[:20]:
+                        if line.strip():
+                            errors.append(f"[TS] {line}")
+            except FileNotFoundError:
+                logger.info("tsc not found — skipping TypeScript compile check")
+            except Exception as e:
+                logger.warning(f"tsc check error: {e}")
+
+        passed = len(errors) == 0
+        (logger.info if passed else logger.error)(
+            f"Phase {phase_num} compile check: {'PASSED' if passed else f'FAILED ({len(errors)} errors)'}")
+        if on_progress:
+            try:
+                await on_progress(phase_num, "compile_check",
+                                  "ok" if passed else "failed",
+                                  f"Compile: {'PASSED' if passed else f'FAILED ({len(errors)} errors)'}")
+            except Exception:
+                pass
+        return {"passed": passed, "errors": errors}
 
     async def _run_e2e_tests(self, project_path: str,
                               on_progress: Callable = None) -> dict:

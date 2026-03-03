@@ -107,6 +107,7 @@ class GitManager:
                     "docs/planning/\n"
                     "docs/analysis/\n"
                     "*.protocol.md\n"
+                    ".autonomy/\n"
                     "__pycache__/\n"
                     "*.pyc\n"
                     ".env\n"
@@ -134,6 +135,11 @@ class GitManager:
         """Create a branch for a phase. Returns branch name."""
         branch = f"phase/{phase}-{name.lower().replace(' ', '-')}"
         try:
+            # Stash any uncommitted changes (e.g. contracts/.locked from contract_generator)
+            try:
+                self._run_git("stash", "--include-untracked")
+            except GitError:
+                pass  # Nothing to stash
             # Ensure we're on develop
             self._run_git("checkout", "develop")
             self._run_git("pull", "--rebase", check=False)  # May fail if no remote

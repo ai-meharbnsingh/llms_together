@@ -30,6 +30,7 @@ VALID_ROLES = {
     "summarization",
     "frontend_design",
     "project_classification",
+    "orchestrator_reasoning",
 }
 
 

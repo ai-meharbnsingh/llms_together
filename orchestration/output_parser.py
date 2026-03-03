@@ -44,11 +44,41 @@ class OutputParser:
     }
     """
 
-    def __init__(self, project_path: str):
+    def __init__(self, project_path: str, dac_tagger=None):
         self.project_path = Path(project_path)
+        self._dac_tagger = dac_tagger
         self._files_written: List[str] = []
         self._decisions_logged: List[dict] = []
         self._escalations: List[dict] = []
+
+    def _emit_dac_tag(self, task_id: str, tag_type: str, context: str,
+                      source_step: str, source_worker: str,
+                      project_id: str = None):
+        """Route DaC tag through dac_tagger (creates learning log entry) or fall back to direct queue_write."""
+        if self._dac_tagger:
+            self._dac_tagger.tag(
+                task_id=task_id,
+                event_type=tag_type,  # raw tag type (TRAP/HAL) — will pass through EVENT_TAG_MAP
+                context=context,
+                source_step=source_step,
+                source_worker=source_worker,
+                project_id=project_id,
+            )
+        else:
+            queue_write(
+                operation="insert",
+                table="dac_tags",
+                params={
+                    "task_id": task_id,
+                    "tag_type": tag_type,
+                    "context": context,
+                    "source_step": source_step,
+                    "source_worker": source_worker,
+                    "project_id": project_id,
+                    "status": "open",
+                },
+                requester="output_parser",
+            )
 
     @staticmethod
     def _escape_string_content(inner: str) -> str:
@@ -99,16 +129,78 @@ class OutputParser:
         """
         Replace JavaScript template literals (backtick strings) inside JSON with
         properly escaped JSON strings.
-        Workers like Qwen/DeepSeek sometimes wrap TypeScript/JS content in backticks
-        instead of valid JSON double-quoted strings.
-        Avoids matching triple-backtick code-fence markers.
+        Uses character-by-character scanning to correctly handle:
+        - Nested template expressions: ${...}
+        - Backticks inside template expressions: ${ `inner` }
+        - Escaped backticks: \\`
+        - Triple-backtick code fences (skipped verbatim)
         """
-        def replace_backtick(m):
-            return cls._escape_string_content(m.group(1))
+        result = []
+        i = 0
+        n = len(text)
 
-        # Match single backtick strings; negative look-ahead/behind prevents
-        # matching ``` code-fence markers.
-        return re.sub(r'(?<!`)`(?!`)([\s\S]*?)(?<!`)`(?!`)', replace_backtick, text)
+        while i < n:
+            # Skip triple-backtick code fences verbatim
+            if text[i:i+3] == '```':
+                end = text.find('```', i + 3)
+                if end >= 0:
+                    result.append(text[i:end + 3])
+                    i = end + 3
+                else:
+                    result.append(text[i])
+                    i += 1
+                continue
+
+            # Single backtick — scan to matching closing backtick
+            if text[i] == '`':
+                j = i + 1
+                content_chars = []
+                depth = 0  # depth of ${ } nesting
+
+                while j < n:
+                    c = text[j]
+
+                    # Handle escape sequences
+                    if c == '\\' and j + 1 < n:
+                        nc = text[j + 1]
+                        if nc == '`':
+                            content_chars.append('`')
+                        else:
+                            content_chars.append(c)
+                            content_chars.append(nc)
+                        j += 2
+                        continue
+
+                    # Template expression open ${
+                    if c == '$' and j + 1 < n and text[j + 1] == '{':
+                        depth += 1
+                        content_chars.append('${')
+                        j += 2
+                        continue
+
+                    # Closing brace of template expression
+                    if c == '}' and depth > 0:
+                        depth -= 1
+                        content_chars.append('}')
+                        j += 1
+                        continue
+
+                    # Closing backtick (only at depth 0)
+                    if c == '`' and depth == 0:
+                        j += 1
+                        break
+
+                    content_chars.append(c)
+                    j += 1
+
+                result.append(cls._escape_string_content(''.join(content_chars)))
+                i = j
+                continue
+
+            result.append(text[i])
+            i += 1
+
+        return ''.join(result)
 
     def parse(self, raw_output: str) -> dict:
         """
@@ -140,16 +232,19 @@ class OutputParser:
             except json.JSONDecodeError:
                 pass
 
-            # Try extracting JSON from markdown code blocks
-            json_match = re.search(r'```(?:json)?\s*\n({[\s\S]*?})\s*\n```', candidate)
-            if json_match:
-                block = json_match.group(1)
-                # Try the block raw, then with each sanitizer applied
+            # Try extracting JSON from markdown code blocks.
+            # First capture full fence content (not just {…?}), then use
+            # brace-counting to find the correct closing brace — this handles
+            # nested braces inside string values that trip up non-greedy regex.
+            fence_match = re.search(r'```(?:json)?\s*\n([\s\S]*?)\n```', candidate)
+            if fence_match:
+                fence_content = fence_match.group(1).strip()
+                # Try direct parse of full fence content first
                 for attempt in [
-                    block,
-                    self._sanitize_triple_quotes(block),
-                    self._sanitize_backtick_strings(block),
-                    self._sanitize_backtick_strings(self._sanitize_triple_quotes(block)),
+                    fence_content,
+                    self._sanitize_triple_quotes(fence_content),
+                    self._sanitize_backtick_strings(fence_content),
+                    self._sanitize_backtick_strings(self._sanitize_triple_quotes(fence_content)),
                 ]:
                     try:
                         result = json.loads(attempt)
@@ -157,6 +252,31 @@ class OutputParser:
                             return self._validate_structure(result)
                     except json.JSONDecodeError:
                         pass
+                # Fence content didn't parse directly — apply brace-counting
+                brace_pos = fence_content.find('{')
+                if brace_pos >= 0:
+                    depth = 0
+                    for i in range(brace_pos, len(fence_content)):
+                        if fence_content[i] == '{':
+                            depth += 1
+                        elif fence_content[i] == '}':
+                            depth -= 1
+                            if depth == 0:
+                                block = fence_content[brace_pos:i + 1]
+                                for attempt in [
+                                    block,
+                                    self._sanitize_backtick_strings(block),
+                                    self._sanitize_backtick_strings(
+                                        self._sanitize_triple_quotes(block)
+                                    ),
+                                ]:
+                                    try:
+                                        result = json.loads(attempt)
+                                        if isinstance(result, dict):
+                                            return self._validate_structure(result)
+                                    except json.JSONDecodeError:
+                                        pass
+                                break
 
             # Try finding JSON object anywhere in the text (brace-counting)
             brace_start = candidate.find('{')
@@ -306,23 +426,17 @@ class OutputParser:
                     f"but scope is {allowed_prefix!r} — file skipped"
                 )
                 try:
-                    queue_write(
-                        operation="insert",
-                        table="dac_tags",
-                        params={
-                            "task_id": task_id,
-                            "tag_type": "TRAP",
-                            "context": (
-                                f"out_of_scope_write: {rel_path} "
-                                f"(allowed prefix: {allowed_prefix})"
-                            ),
-                            "source_step": "output_parser_scope_check",
-                            "source_worker": "output_parser",
-                            "status": "open",
-                        },
-                        requester="output_parser",
+                    self._emit_dac_tag(
+                        task_id=task_id,
+                        tag_type="TRAP",
+                        context=(
+                            f"out_of_scope_write: {rel_path} "
+                            f"(allowed prefix: {allowed_prefix})"
+                        ),
+                        source_step="output_parser_scope_check",
+                        source_worker="output_parser",
                     )
-                except RuntimeError as e:
+                except (RuntimeError, Exception) as e:
                     logger.error(f"Failed to queue scope TRAP tag: {e}")
                 return violation
 
@@ -405,7 +519,8 @@ class OutputParser:
 
     def parse_and_apply(self, raw_output: str, task_id: str,
                          worker_name: str = "unknown",
-                         task_module: Optional[str] = None) -> Tuple[dict, List[dict]]:
+                         task_module: Optional[str] = None,
+                         project_id: Optional[str] = None) -> Tuple[dict, List[dict]]:
         """
         Convenience: parse + apply in one call.
         Returns (apply_summary, violations).
@@ -427,20 +542,15 @@ class OutputParser:
                 "detail": str(e),
             })
             try:
-                queue_write(
-                    operation="insert",
-                    table="dac_tags",
-                    params={
-                        "task_id": task_id,
-                        "tag_type": tag_type,
-                        "context": f"Malformed output from {worker_name}: {str(e)[:500]}",
-                        "source_step": "output_parse",
-                        "source_worker": worker_name,
-                        "status": "open",
-                    },
-                    requester="output_parser",
+                self._emit_dac_tag(
+                    task_id=task_id,
+                    tag_type=tag_type,
+                    context=f"Malformed output from {worker_name}: {str(e)[:500]}",
+                    source_step="output_parse",
+                    source_worker=worker_name,
+                    project_id=project_id,
                 )
-            except RuntimeError as qe:
+            except (RuntimeError, Exception) as qe:
                 logger.critical(f"Failed to queue {tag_type} tag: {qe}")
             return {"files_written": [], "decisions_logged": [],
                     "escalations": [], "notes": [], "tests_needed": [],

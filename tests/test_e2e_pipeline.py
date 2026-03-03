@@ -564,8 +564,21 @@ class TestFullPipelineE2E:
         async def mock_quality_gate(task, code_out, pp, validator=None):
             return {"verdict": "APPROVED", "confidence": 0.9, "issues": []}
 
+        # Disable worktree isolation for this mocked test — WorkspaceManager
+        # requires a real git repo, and we're mocking GitManager entirely.
+        _orig_ws = orchestrator.config.get("workspaces", {})
+        orchestrator.config["workspaces"] = {"enabled": False}
+
+        # Mock _run_e2e_tests — the mock workers generate JS-style syntax
+        # (`true`/`false`) in Python test files, which causes real pytest to
+        # fail. Since this test validates the orchestrator lifecycle, not the
+        # generated code quality, mock E2E to pass.
+        async def mock_e2e(project_path, on_progress=None):
+            return {"success": True, "tests_run": 0, "tests_passed": 0}
+
         with patch.object(orchestrator, "_phase_blueprint", side_effect=mock_blueprint), \
              patch.object(orchestrator, "_quality_gate", side_effect=mock_quality_gate), \
+             patch.object(orchestrator, "_run_e2e_tests", side_effect=mock_e2e), \
              patch("orchestration.master_orchestrator.GitManager", return_value=mock_git), \
              patch("orchestration.master_orchestrator.OutputParser", return_value=mock_parser_instance), \
              patch("orchestration.master_orchestrator.ContractValidator", return_value=mock_validator):

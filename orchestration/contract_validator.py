@@ -6,6 +6,7 @@ Checks: API endpoints vs api_contract.json, types vs types.json, DB vs db_schema
 ════════════════════════════════════════
 """
 
+import ast
 import json
 import logging
 import re
@@ -89,6 +90,10 @@ class ContractValidator:
         # Check for undeclared endpoints
         mismatches.extend(self._check_undeclared_endpoints(code_files))
 
+        # AST-based import resolution checks
+        mismatches.extend(self._validate_python_imports(code_files))
+        mismatches.extend(self._validate_ts_imports(code_files))
+
         valid = not any(m["severity"] == "error" for m in mismatches)
 
         if mismatches:
@@ -97,6 +102,80 @@ class ContractValidator:
             logger.info("Contract validation: all checks passed")
 
         return {"valid": valid, "mismatches": mismatches}
+
+    def _validate_python_imports(self, code_files: List[dict]) -> List[dict]:
+        """AST-parse .py files and check local `from X import Y` resolve to actual files."""
+        mismatches = []
+        for f in code_files:
+            path = f.get("path", "")
+            if not path.endswith(".py"):
+                continue
+            content = f.get("content", "")
+            if not content.strip():
+                continue
+            try:
+                tree = ast.parse(content)
+            except SyntaxError as e:
+                mismatches.append({"type": "python_syntax_error",
+                                   "detail": f"SyntaxError: {e}", "file": path,
+                                   "severity": "error"})
+                continue
+            source_dir = (self.project_path / path).parent
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                module_parts = node.module.split(".")
+                level = node.level or 0
+                if level > 0:
+                    target_dir = source_dir
+                    for _ in range(level - 1):
+                        target_dir = target_dir.parent
+                    candidate = target_dir / Path(*module_parts)
+                    exists = (candidate.with_suffix(".py").exists()
+                              or (candidate / "__init__.py").exists())
+                    if not exists:
+                        mismatches.append({"type": "python_missing_import",
+                                           "detail": f"Relative import 'from {'.' * level}{node.module}'"
+                                                     f" not resolved — in {path}",
+                                           "file": path, "severity": "warning"})
+                else:
+                    first_seg = module_parts[0]
+                    local_pkg = self.project_path / first_seg
+                    local_mod = self.project_path / f"{first_seg}.py"
+                    if local_pkg.is_dir() or local_mod.exists():
+                        full_candidate = self.project_path / Path(*module_parts)
+                        exists = (full_candidate.with_suffix(".py").exists()
+                                  or (full_candidate / "__init__.py").exists())
+                        if not exists:
+                            mismatches.append({"type": "python_missing_import",
+                                               "detail": f"Local import 'from {node.module}'"
+                                                         f" has no file — in {path}",
+                                               "file": path, "severity": "warning"})
+        return mismatches
+
+    def _validate_ts_imports(self, code_files: List[dict]) -> List[dict]:
+        """Regex-scan .ts/.tsx files for relative imports and check file existence."""
+        mismatches = []
+        import_re = re.compile(
+            r'(?:import\s+(?:.*?\s+from\s+|)|require\s*\(\s*)["\'](\.[^"\']+)["\']',
+            re.MULTILINE)
+        ts_exts = [".ts", ".tsx", ".js", ".jsx"]
+        for f in code_files:
+            path = f.get("path", "")
+            if not any(path.endswith(ext) for ext in [".ts", ".tsx"]):
+                continue
+            source_dir = (self.project_path / path).parent
+            for m in import_re.finditer(f.get("content", "")):
+                rel = m.group(1)
+                base = (source_dir / rel).resolve()
+                found = any(base.with_suffix(ext).exists() for ext in ts_exts)
+                if not found:
+                    found = any((base / f"index{ext}").exists() for ext in ts_exts)
+                if not found:
+                    mismatches.append({"type": "ts_missing_import",
+                                       "detail": f"TS import '{rel}' not resolved — in {path}",
+                                       "file": path, "severity": "warning"})
+        return mismatches
 
     def _validate_api(self, code_files: List[dict]) -> List[dict]:
         """Check code files reference only declared API endpoints."""

@@ -76,11 +76,12 @@ CRITICAL RULE — TESTS ARE GROUND TRUTH:
 class TDDStepResult:
     """Result of a single TDD step."""
     __slots__ = ("step_id", "success", "output", "bugs_found", "dac_tags",
-                 "elapsed_ms", "skipped", "error")
+                 "elapsed_ms", "skipped", "error", "metadata")
 
     def __init__(self, step_id: str, success: bool = True, output: str = "",
                  bugs_found: List[dict] = None, dac_tags: List[str] = None,
-                 elapsed_ms: int = 0, skipped: bool = False, error: str = None):
+                 elapsed_ms: int = 0, skipped: bool = False, error: str = None,
+                 metadata: dict = None):
         self.step_id = step_id
         self.success = success
         self.output = output
@@ -89,6 +90,7 @@ class TDDStepResult:
         self.elapsed_ms = elapsed_ms
         self.skipped = skipped
         self.error = error
+        self.metadata = metadata or {}
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +129,32 @@ class TDDPipeline:
         )
         self._results: Dict[str, TDDStepResult] = {}
         self._on_progress: Optional[Callable] = None
+
+    async def _run_pytest_for_task(self, test_file_path: str,
+                                    task_id: str, phase: str = "RED") -> dict:
+        """Run pytest on a specific test file. Returns {"passed": bool|None, "stdout": str, "returncode": int}.
+        passed=None means pytest could not run. Timeout: 60s."""
+        import subprocess as _sp
+        if not self.project_path:
+            return {"passed": None, "stdout": "no project_path", "returncode": -1}
+        test_path = Path(test_file_path)
+        if not test_path.exists():
+            return {"passed": False, "stdout": "test file missing", "returncode": -1}
+        try:
+            proc = await asyncio.to_thread(
+                _sp.run,
+                ["python", "-m", "pytest", str(test_path), "--tb=short", "-q",
+                 "--no-header", "--timeout=30"],
+                capture_output=True, text=True, timeout=60, cwd=self.project_path)
+            passed = proc.returncode == 0
+            logger.info(f"TDD [{phase}] {task_id}: pytest rc={proc.returncode} "
+                        f"({'PASS' if passed else 'FAIL'})")
+            return {"passed": passed,
+                    "stdout": (proc.stdout + proc.stderr)[:3000],
+                    "returncode": proc.returncode}
+        except Exception as e:
+            logger.warning(f"TDD [{phase}] {task_id}: pytest error: {e}")
+            return {"passed": None, "stdout": str(e), "returncode": -1}
 
     @staticmethod
     def is_fast_track(task: dict) -> bool:
@@ -381,47 +409,65 @@ Return a numbered list of testable acceptance criteria. Each must be:
 
     async def _step_write_tests(self, task: dict, project: dict,
                                  code_output: dict) -> TDDStepResult:
-        """Step 2: Write failing tests based on AC."""
+        """Step 2 RED: generate tests via LLM, write to disk, run pytest to confirm RED."""
         ac_result = self._results.get("AC")
         files_context = "\n".join(
             f"File: {f['path']}\n{f['content'][:2000]}"
             for f in code_output.get("files", [])[:5]
         )
+        prompt = (f"Write failing tests for this task (RED phase — tests must fail initially).\n\n"
+                  f"Task: {task['description']}\nAC: {ac_result.output if ac_result else 'See task'}\n"
+                  f"Code:\n{files_context}\n\n"
+                  f"Use pytest (Python) or vitest (TS). Cover happy path, edge cases, errors.\n"
+                  f"Return ONLY the test file content.")
+        response = await self._call_tdd_worker(prompt, "TDD RED: write failing tests")
 
-        prompt = f"""Write failing tests for this task. Tests MUST fail initially (RED phase).
+        pytest_result = {"passed": None, "stdout": "", "returncode": -1}
+        test_file_path = None
+        if self.project_path and response:
+            task_id = task.get("task_id", "unknown")
+            tests_dir = Path(self.project_path) / "tests"
+            try:
+                tests_dir.mkdir(parents=True, exist_ok=True)
+                test_file_path = str(tests_dir / f"test_{task_id}_tdd.py")
+                Path(test_file_path).write_text(response, encoding="utf-8")
+                pytest_result = await self._run_pytest_for_task(test_file_path, task_id, "RED")
+                if pytest_result["passed"] is True:
+                    logger.info(f"TDD RED {task_id}: tests already pass (code may be correct)")
+                elif pytest_result["passed"] is False:
+                    logger.info(f"TDD RED {task_id}: tests fail correctly ✓")
+            except IOError as e:
+                logger.warning(f"TDD RED: could not write test file: {e}")
 
-Task: {task['description']}
-Acceptance Criteria:
-{ac_result.output if ac_result else 'See task description'}
-
-Code to test:
-{files_context}
-
-Write comprehensive tests using pytest (Python) or vitest (TypeScript).
-Cover: happy path, edge cases, error cases.
-Return the test file content."""
-
-        response = await self._call_tdd_worker(prompt, "Write failing tests (TDD RED phase)")
-        return TDDStepResult(step_id="RED", success=True, output=response)
+        return TDDStepResult(step_id="RED", success=True, output=response,
+                             metadata={"test_file": test_file_path, "pytest_red": pytest_result})
 
     async def _step_minimal_impl(self, task: dict, code_output: dict) -> TDDStepResult:
-        """Step 3: Minimal implementation to pass tests."""
+        """Step 3 GREEN: generate minimal implementation, run pytest to verify it passes."""
         tests = self._results.get("RED")
+        prompt = (f"Write MINIMAL code to pass these tests (GREEN phase).\n\n"
+                  f"Task: {task['description']}\nTests:\n{tests.output[:3000] if tests else ''}\n\n"
+                  f"Rules: smallest code to pass tests, no extra features.\n{TESTING_GROUND_TRUTH_RULE}")
+        response = await self._call_tdd_worker(prompt, "TDD GREEN: minimal implementation")
 
-        prompt = f"""Write the MINIMAL code to make these tests pass (GREEN phase).
+        pytest_result = {"passed": None, "stdout": "", "returncode": -1}
+        red_metadata = (tests.metadata if tests else {}) or {}
+        test_file_path = red_metadata.get("test_file")
+        if test_file_path and Path(test_file_path).exists():
+            task_id = task.get("task_id", "unknown")
+            pytest_result = await self._run_pytest_for_task(test_file_path, task_id, "GREEN")
+            if pytest_result["passed"] is False:
+                logger.warning(f"TDD GREEN {task_id}: tests STILL FAIL — gate issue.\n"
+                               f"{pytest_result['stdout'][:500]}")
+            elif pytest_result["passed"] is True:
+                logger.info(f"TDD GREEN {task_id}: tests PASS ✓")
 
-Task: {task['description']}
-Tests:
-{tests.output[:3000] if tests else 'See previous step'}
-
-Rules:
-- Write the SMALLEST amount of code that makes tests pass
-- No premature optimization
-- No extra features beyond what tests require
-{TESTING_GROUND_TRUTH_RULE}"""
-
-        response = await self._call_tdd_worker(prompt, "Write minimal code to pass tests (TDD GREEN phase)")
-        return TDDStepResult(step_id="GREEN", success=True, output=response)
+        # success=True intentional: hard failure would kill the whole pipeline and lose prior work.
+        # green_passed=False surfaces in metadata for quality gate and observability.
+        return TDDStepResult(step_id="GREEN", success=True, output=response,
+                             metadata={"test_file": test_file_path,
+                                       "pytest_green": pytest_result,
+                                       "green_passed": pytest_result.get("passed")})
 
     async def _step_bug_capture(self, task: dict, code_output: dict) -> TDDStepResult:
         """Step 4: Static bug scan — flake8 findings + LLM analysis."""

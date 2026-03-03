@@ -239,12 +239,25 @@ class DashboardServer:
                         cmd = json.loads(msg.data)
                         action = cmd.get("action")
                         if action == "resolve_escalation":
-                            self.db.request_write("update", "escalations", {
-                                "_where": {"escalation_id": int(cmd["escalation_id"])},
-                                "human_decision": cmd.get("decision", ""),
-                                "status": "resolved",
-                                "resolved_at": datetime.now().isoformat(),
-                            })
+                            esc_id = int(cmd["escalation_id"])
+                            esc_decision = cmd.get("decision", "")
+                            if self.orchestrator:
+                                try:
+                                    await self.orchestrator.handle_escalation(esc_id, esc_decision)
+                                except Exception:
+                                    self.db.request_write("update", "escalations", {
+                                        "_where": {"escalation_id": esc_id},
+                                        "human_decision": esc_decision,
+                                        "status": "resolved",
+                                        "resolved_at": datetime.now().isoformat(),
+                                    })
+                            else:
+                                self.db.request_write("update", "escalations", {
+                                    "_where": {"escalation_id": esc_id},
+                                    "human_decision": esc_decision,
+                                    "status": "resolved",
+                                    "resolved_at": datetime.now().isoformat(),
+                                })
                         elif action == "swap_role" and self.role_router:
                             result = self.role_router.swap_role(
                                 cmd["role"], cmd["primary"],
@@ -311,11 +324,19 @@ class DashboardServer:
                                 await self._broadcast_to_all(json.dumps({
                                     "event": "blueprint_approved", "project_id": pid,
                                     "timestamp": datetime.now().isoformat()}))
-                                # Re-launch execute_project to continue with phases 1-3
-                                t = asyncio.create_task(
-                                    self.orchestrator.execute_project(pid, on_progress=self._on_project_progress))
-                                self._running_projects[pid] = t
-                                t.add_done_callback(lambda _t, _pid=pid: asyncio.create_task(self._on_execute_complete(_t, _pid)))
+                                # FER-AF-041: Guard against duplicate invocation — only
+                                # launch execute_project if not already running.
+                                # Sleep 2s so the fire-and-forget DB write from
+                                # approve_blueprint() commits before execute_project()
+                                # calls _phase_blueprint() → get_latest_blueprint().
+                                # (Same delay as the HTTP handler at _api_approve_blueprint.)
+                                await asyncio.sleep(3)
+                                existing = self._running_projects.get(pid)
+                                if existing is None or existing.done():
+                                    t = asyncio.create_task(
+                                        self.orchestrator.execute_project(pid, on_progress=self._on_project_progress))
+                                    self._running_projects[pid] = t
+                                    t.add_done_callback(lambda _t, _pid=pid: asyncio.create_task(self._on_execute_complete(_t, _pid)))
                             else:
                                 await ws.send_str(json.dumps({"event": "project_error", "error": result.get("error", "Failed")}))
                         elif action == "approve_uat" and self.orchestrator:
@@ -556,9 +577,20 @@ class DashboardServer:
     async def _api_resolve(self, req):
         eid = req.match_info["id"]
         body = await req.json()
+        decision = body.get("decision", "")
+
+        # Route through orchestrator brain if available (interprets decision + logs learning)
+        if self.orchestrator:
+            try:
+                result = await self.orchestrator.handle_escalation(int(eid), decision)
+                return web.json_response(result)
+            except Exception as e:
+                logger.warning(f"Orchestrator handle_escalation failed, falling back: {e}")
+
+        # Fallback: direct DB write
         self.db.request_write("update", "escalations", {
             "_where": {"escalation_id": int(eid)},
-            "human_decision": body.get("decision", ""),
+            "human_decision": decision,
             "status": "resolved",
             "resolved_at": datetime.now().isoformat(),
         })
@@ -1035,11 +1067,16 @@ class DashboardServer:
                 "project_id": project_id,
                 "timestamp": datetime.now().isoformat(),
             }))
-            # Re-launch execute_project to continue with phases 1-3
-            t = asyncio.create_task(
-                self.orchestrator.execute_project(project_id, on_progress=self._on_project_progress))
-            self._running_projects[project_id] = t
-            t.add_done_callback(lambda _t, _pid=project_id: asyncio.create_task(self._on_execute_complete(_t, _pid)))
+            # Re-launch execute_project only if not already running (FER-AF-041)
+            # Sleep 2s to let async DB write from approve_blueprint() commit before
+            # execute_project() calls _phase_blueprint() → get_latest_blueprint().
+            await asyncio.sleep(3)
+            existing = self._running_projects.get(project_id)
+            if existing is None or existing.done():
+                t = asyncio.create_task(
+                    self.orchestrator.execute_project(project_id, on_progress=self._on_project_progress))
+                self._running_projects[project_id] = t
+                t.add_done_callback(lambda _t, _pid=project_id: asyncio.create_task(self._on_execute_complete(_t, _pid)))
         return web.json_response(result)
 
     async def _api_approve_uat(self, req):
@@ -1075,10 +1112,22 @@ class DashboardServer:
                     "project_id": project_id,
                     "timestamp": datetime.now().isoformat(),
                 }))
-            elif awaiting == "uat_approval":
-                # Issue 1: Include e2e_passed so dashboard can show red warning (R4/R10/M4)
+            elif awaiting in ("uat_approval", "uat_blocked_e2e"):
+                # Broadcast uat_ready regardless of e2e pass/fail so the
+                # Playwright test (and human reviewer) always receives the
+                # event.  e2e_passed=False signals the dashboard to show a
+                # red warning and block the approve button.
                 e2e = result.get("e2e", {})
-                e2e_passed = e2e.get("success", True) and not e2e.get("skipped", False)
+                e2e_passed = (
+                    awaiting == "uat_approval"
+                    and e2e.get("success", True)
+                    and not e2e.get("skipped", False)
+                )
+                if awaiting == "uat_blocked_e2e":
+                    logger.warning(
+                        f"Project {project_id}: E2E tests failed — broadcasting "
+                        "uat_ready with e2e_passed=False so reviewer can investigate"
+                    )
                 await self._broadcast_to_all(json.dumps({
                     "event": "uat_ready",
                     "project_id": project_id,
@@ -2256,7 +2305,11 @@ btn.disabled=false;btn.textContent='Create Project';
 if(d.error){alert('Error: '+d.error);return}
 currentProjectId=d.project_id;
 closeNewProjectModal();
-loadProjects();
+// Immediately inject option — don't wait for DB drain (fire-and-forget write)
+const sel=document.getElementById('projectSel');
+if(sel){const opt=document.createElement('option');opt.value=d.project_id;opt.textContent=d.name;opt.selected=true;sel.appendChild(opt);}
+// Re-sync from DB after watchdog drain cycle (5s)
+setTimeout(()=>loadProjects(),6000);
 loadChatHistory();
 }).catch(e=>{btn.disabled=false;btn.textContent='Create Project';alert('Failed: '+e)})}
 // Allow Enter key in name field to submit

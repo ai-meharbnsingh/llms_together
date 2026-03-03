@@ -46,11 +46,21 @@ def tmp_db(tmp_path):
     """Create a real SQLite DB with full schema + seed FK parents."""
     db_path = str(tmp_path / "test_factory.db")
     wdb = WatchdogDB(db_path)
+    # Drain any stale writes from other test modules (global queue pollution)
+    q = get_write_queue()
+    while not q.empty():
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
     # Seed FK parents: dashboard_state for context_summaries FK
     import sqlite3
     conn = sqlite3.connect(db_path)
-    conn.execute("INSERT OR IGNORE INTO dashboard_state (instance_name, status) VALUES ('phi3-orchestrator', 'active')")
-    conn.execute("INSERT OR IGNORE INTO dashboard_state (instance_name, status) VALUES ('phi3-claude', 'active')")
+    for name in ("orchestrator", "phi3-orchestrator", "phi3-claude",
+                 "deepseek", "qwen", "claude", "kimi", "gemini"):
+        conn.execute(
+            "INSERT OR IGNORE INTO dashboard_state (instance_name, status) "
+            "VALUES (?, 'active')", (name,))
     # Seed project + tasks for chat_summaries FK
     conn.execute("INSERT OR IGNORE INTO projects (project_id, name, description, status) VALUES ('proj_test', 'Test', 'Test project', 'active')")
     for i in range(5):

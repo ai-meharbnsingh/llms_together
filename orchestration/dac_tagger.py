@@ -136,6 +136,29 @@ class DaCTagger:
         except RuntimeError as e:
             logger.error(f"Failed to queue training_data row: {e}")
 
+        # Wire to learning_log so the feedback loop is closed.
+        # Previously broken: dac_tagger never called log_fix() → learning log stayed empty
+        # → context_manager injected nothing → workers repeated same mistakes.
+        if self.db:
+            try:
+                from orchestration.learning_log import LearningLog
+                ll = LearningLog(self.db)
+                context_words = [w for w in context.lower().split() if len(w) > 4][:3]
+                ll.log_fix(
+                    bug_description=f"[{tag_type}] {context[:300]}",
+                    root_cause=f"[{tag_type}] {event_type}: {context[:150]}",
+                    fix_applied=_TRAINING_SOLUTIONS.get(tag_type, "Investigate and fix"),
+                    fixed_by="auto_dac_tagger",
+                    prevention_strategy=f"Prevent {tag_type} pattern: {context[:200]}",
+                    keywords=[tag_type, event_type, source_step or "", source_worker or ""] + context_words,
+                    project_id=project_id,
+                    task_id=task_id,
+                    project_type=project_type,
+                    phase=phase,
+                )
+            except Exception as e:
+                logger.debug(f"learning_log write failed (non-fatal): {e}")
+
         return tag_type
 
     def tag_from_tdd_result(self, task_id: str, tdd_result: dict,

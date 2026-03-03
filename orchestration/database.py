@@ -831,8 +831,12 @@ class ReadOnlyDB:
                 clauses.append("project_type = ?")
                 params.append(project_type)
             if keywords:
-                clauses.append("keywords LIKE ?")
-                params.append(f"%{keywords}%")
+                clauses.append(
+                    "(keywords LIKE ? OR bug_description LIKE ? "
+                    "OR root_cause LIKE ? OR prevention_strategy LIKE ?)"
+                )
+                kw_pattern = f"%{keywords}%"
+                params.extend([kw_pattern, kw_pattern, kw_pattern, kw_pattern])
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(  # nosemgrep
                 f"SELECT * FROM learning_log {where} ORDER BY occurrence_count DESC, created_at DESC LIMIT ?",

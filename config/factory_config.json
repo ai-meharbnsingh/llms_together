@@ -61,7 +61,7 @@
       "instances": 6
     }
   },
-  "local_test_mode": false,
+  "local_test_mode": true,
   "local_roles": {
     "blueprint_generation": { "primary": "deepseek", "fallback": "qwen" },
     "tdd_testing":          { "primary": "deepseek", "fallback": "qwen" },
@@ -73,7 +73,8 @@
     "code_generation_complex": { "primary": "deepseek", "fallback": "qwen" },
     "frontend_design":      { "primary": "deepseek", "fallback": "qwen" },
     "project_classification": { "primary": "qwen",  "fallback": "deepseek" },
-    "summarization":        { "primary": "deepseek" }
+    "summarization":        { "primary": "deepseek" },
+    "orchestrator_reasoning": { "primary": "deepseek", "fallback": "qwen" }
   },
   "roles": {
     "code_generation_simple": {
@@ -118,6 +119,10 @@
     "project_classification": {
       "primary": "kimi",
       "fallback": "claude"
+    },
+    "orchestrator_reasoning": {
+      "primary": "deepseek",
+      "fallback": "qwen"
     }
   },
   "project_types": {
@@ -195,6 +200,10 @@
     "local_model_preference": 0.8,
     "max_api_cost_per_project": 50.0,
     "track_cli_usage": true
+  },
+  "workspaces": {
+    "enabled": true,
+    "fallback_on_failure": true
   },
   "dashboard": {
     "host": "127.0.0.1",

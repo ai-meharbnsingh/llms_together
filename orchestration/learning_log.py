@@ -89,7 +89,14 @@ class LearningLog:
             return False
 
     def _find_similar(self, root_cause: str, description: str) -> Optional[dict]:
-        """Find a similar existing entry (same root cause pattern)."""
+        """Find a similar existing entry (same root cause pattern).
+        Only deduplicates within the same tag type prefix (e.g. [SER] only matches [SER]).
+        """
+        # Extract tag type prefix if present (e.g. "[SER]" from "[SER] contract_violation: ...")
+        import re
+        prefix_match = re.match(r'\[([A-Z]+)\]', root_cause)
+        root_prefix = prefix_match.group(1) if prefix_match else None
+
         # Search by keywords extracted from root cause
         words = root_cause.lower().split()
         significant_words = [w for w in words if len(w) > 4][:3]
@@ -97,7 +104,14 @@ class LearningLog:
         for word in significant_words:
             entries = self.db.get_learning_log(keywords=word, limit=10)
             for entry in entries:
-                if self._is_similar(entry.get("root_cause", ""), root_cause):
+                entry_rc = entry.get("root_cause", "")
+                # Only match within same tag type partition
+                if root_prefix:
+                    entry_prefix_match = re.match(r'\[([A-Z]+)\]', entry_rc)
+                    entry_prefix = entry_prefix_match.group(1) if entry_prefix_match else None
+                    if entry_prefix != root_prefix:
+                        continue
+                if self._is_similar(entry_rc, root_cause):
                     return entry
         return None
 
@@ -112,7 +126,7 @@ class LearningLog:
         overlap = len(existing_words & new_words)
         total = len(existing_words | new_words)
 
-        return (overlap / total) > 0.6 if total > 0 else False
+        return (overlap / total) > 0.8 if total > 0 else False
 
     # Entries younger than this threshold are eligible for injection regardless of count.
     _EXPIRY_DAYS = 90

@@ -948,15 +948,25 @@ class MasterOrchestrator:
         return filtered
 
     def get_available_workers_with_status(self) -> list:
-        """Return list of workers with name and type for UI dropdown."""
+        """Return list of workers with name, type, and live health status."""
         results = []
         for name, adapter in self.router.workers.items():
-            results.append({
+            entry = {
                 "name": name,
                 "type": adapter.config.get("type", "unknown"),
                 "model": adapter.config.get("model", name),
                 "timeout": adapter.config.get("timeout", 120),
-            })
+            }
+            # Enrich with live health data from worker_health table
+            health = self.db.get_worker_health(name) if self.db else None
+            if health:
+                entry["status"] = health.get("status", "offline")
+                entry["last_heartbeat"] = health.get("last_heartbeat")
+                entry["failure_count"] = health.get("failure_count", 0)
+                entry["total_tasks_completed"] = health.get("total_tasks_completed", 0)
+            else:
+                entry["status"] = "offline"
+            results.append(entry)
         return results
 
     # ─── Project Setup ───
@@ -1725,6 +1735,25 @@ class MasterOrchestrator:
         except Exception as _ce:
             logger.warning(f"Cost tracking write failed (non-fatal): {_ce}")
 
+        # Update context usage on dashboard for this worker
+        try:
+            tokens = worker_result.get("tokens", {})
+            total_tok = tokens.get("prompt", 0) + tokens.get("completion", 0)
+            if total_tok > 0:
+                w_name = self._get_worker_name(role)
+                w_cfg = self.config.get("workers", {}).get(w_name, {})
+                max_ctx = w_cfg.get("max_context_tokens", 0)
+                ctx_pct = (total_tok / max_ctx) if max_ctx > 0 else 0.0
+                self.db.request_write("raw", "dashboard_state", {
+                    "sql": (
+                        "UPDATE dashboard_state SET context_usage_percent=?, "
+                        "context_token_count=? WHERE instance_name=?"
+                    ),
+                    "args": [ctx_pct, total_tok, w_name],
+                })
+        except Exception as _ctx_e:
+            logger.debug(f"Context usage update failed (non-fatal): {_ctx_e}")
+
         if not worker_result.get("success"):
             dac_tagger.tag(task_id, "worker_crash",
                            f"Worker {role} failed on task",
@@ -1879,10 +1908,29 @@ class MasterOrchestrator:
                 )
 
         succeeded = gate_result.get("verdict") != "REJECTED"
+        worker_name = self._get_worker_name(role)
         if succeeded:
             self.db.request_write("update", "tasks", {
                 "_where": {"task_id": task_id},
                 "status": "approved", "current_step": "AD",
+            })
+            # Clear worker's current_task_id and increment completed count
+            self.db.request_write("raw", "dashboard_state", {
+                "sql": (
+                    "UPDATE dashboard_state SET current_task_id=NULL, "
+                    "tasks_completed_today=tasks_completed_today+1, "
+                    "status='idle', last_activity=CURRENT_TIMESTAMP "
+                    "WHERE instance_name=?"
+                ),
+                "args": [worker_name],
+            })
+            self.db.request_write("raw", "worker_health", {
+                "sql": (
+                    "UPDATE worker_health SET "
+                    "total_tasks_completed=total_tasks_completed+1 "
+                    "WHERE worker_id=?"
+                ),
+                "args": [worker_name],
             })
         else:
             dac_tagger.tag(task_id, "double_rejection",
@@ -1891,6 +1939,15 @@ class MasterOrchestrator:
             self.db.request_write("update", "tasks", {
                 "_where": {"task_id": task_id},
                 "status": "failed", "current_step": "AD",
+            })
+            # Clear worker's current_task_id on failure too
+            self.db.request_write("raw", "dashboard_state", {
+                "sql": (
+                    "UPDATE dashboard_state SET current_task_id=NULL, "
+                    "status='idle', last_activity=CURRENT_TIMESTAMP "
+                    "WHERE instance_name=?"
+                ),
+                "args": [worker_name],
             })
 
         # 12. Git commit (async — serialised via _commit_lock to prevent index.lock races)

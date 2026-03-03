@@ -214,9 +214,26 @@ class DashboardServer:
             await asyncio.sleep(self.refresh_ms / 1000)
 
     def _full_status(self):
+        workers = self.db.get_all_dashboard_states()
+        # Merge live health data from worker_health table into each worker entry
+        health_map = {}
+        try:
+            for h in self.db.get_all_worker_health():
+                health_map[h["worker_id"]] = h
+        except Exception:
+            pass
+        for w in workers:
+            h = health_map.get(w.get("instance_name"))
+            if h:
+                w["health"] = h.get("status", "offline")
+                w["last_heartbeat"] = h.get("last_heartbeat")
+                w["failure_count"] = h.get("failure_count", 0)
+                w["total_tasks_completed"] = h.get("total_tasks_completed", 0)
+            else:
+                w["health"] = "offline"
         s = {
             "timestamp": datetime.now().isoformat(),
-            "workers": self.db.get_all_dashboard_states(),
+            "workers": workers,
             "task_stats": self.db.get_task_stats(),
             "escalations": self.db.get_pending_escalations(5),
             "activity": self.db.get_recent_activity(8),
@@ -1512,7 +1529,7 @@ color:var(--green);cursor:pointer;font-size:11px;font-family:inherit;transition:
 <div class="pnl" id="pnl-workers">
 <h2 onclick="togglePanel('pnl-workers')">Worker Status</h2>
 <div class="pnl-body">
-<table><thead><tr><th>Instance</th><th>Status</th><th>Task</th><th>Ctx</th><th>#</th></tr></thead>
+<table><thead><tr><th>Instance</th><th>Status</th><th>Health</th><th>Task</th><th>Last Seen</th><th>#</th></tr></thead>
 <tbody id="wt"></tbody></table>
 <div class="dbw">DB: Watchdog-only writes | bus -> Watchdog -> SQLite</div>
 </div></div>
@@ -1811,12 +1828,14 @@ document.getElementById('lu').textContent=new Date(d.timestamp).toLocaleTimeStri
 // Workers
 const tb=document.getElementById('wt');tb.innerHTML='';
 (d.workers||[]).forEach(w=>{
-const p=((w.context_usage_percent||0)*100).toFixed(0);
-const c=p>85?'crit':p>70?'warn':'ok';
-tb.innerHTML+=`<tr><td><span class="dot ${w.status||'offline'}"></span>${w.instance_name}</td>
-<td>${w.status||'offline'}</td><td>${w.current_task_id||'--'}</td>
-<td><div class="cb"><div class="cf ${c}" style="width:${p}%"></div></div> ${p}%</td>
-<td>${w.tasks_completed_today||0}</td></tr>`});
+const health=w.health||'offline';
+const dashStatus=w.status||'offline';
+const hb=w.last_heartbeat?new Date(w.last_heartbeat+'Z').toLocaleTimeString():'never';
+const tc=w.total_tasks_completed||w.tasks_completed_today||0;
+tb.innerHTML+=`<tr><td><span class="dot ${dashStatus}"></span>${w.instance_name}</td>
+<td>${dashStatus}</td><td><span class="dot ${health}"></span>${health}</td><td>${w.current_task_id||'--'}</td>
+<td>${hb}</td>
+<td>${tc}</td></tr>`});
 
 // Roles
 if(d.roles){currentRoles=d.roles;availWorkers=d.available_workers||[];renderRoles()}

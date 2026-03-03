@@ -600,6 +600,13 @@ class ReadOnlyDB:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_all_worker_health(self) -> list:
+        with self._read_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM worker_health ORDER BY worker_id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_pending_escalations(self, limit: int = 10) -> list:
         with self._read_conn() as conn:
             rows = conn.execute(
@@ -1614,6 +1621,20 @@ class WatchdogDB:
     def get_all_dashboard_states(self):
         with self._read_conn() as conn:
             rows = conn.execute("SELECT * FROM dashboard_state ORDER BY instance_name").fetchall()
+            return [dict(r) for r in rows]
+
+    def get_worker_health(self, worker_id):
+        with self._read_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM worker_health WHERE worker_id=?", (worker_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_all_worker_health(self):
+        with self._read_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM worker_health ORDER BY worker_id"
+            ).fetchall()
             return [dict(r) for r in rows]
 
     def get_task_stats(self, project_id=None):

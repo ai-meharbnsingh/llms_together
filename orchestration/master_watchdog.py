@@ -490,9 +490,14 @@ class MasterWatchdog:
                     reasoning="periodic health check",
                 )
             self.worker_states[name]["status"] = health
+            dash_status = self._health_to_dash(health)
+            dash_update = {"status": dash_status}
+            # Clear stale current_task_id when worker returns to idle
+            if dash_status == "idle":
+                dash_update["current_task_id"] = None
             self.db.update_dashboard_state(
                 instance_name=name,
-                status=self._health_to_dash(health),
+                **dash_update,
             )
             self.db.update_worker_health(
                 worker_id=name,
